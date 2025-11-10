@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(kill:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)",
+      "Bash(pkill:*)",
+      "Bash(find:*)",
+      "Bash(sqlite3:*)",
+      "Bash(lsof:*)",
+      "Bash(test:*)",
+      "Bash(ps:*)",
+      "Bash(ls:*)",
+      "Bash(env)",
+      "Bash(pgrep:*)",
+      "Bash(jq:*)",
+      "Bash(nc:*)",
+      "Bash(echo:*)",
+      "Bash(git add:*)",
+      "Bash(git checkout:*)",
+      "Bash(git fetch:*)",
+      "Bash(git branch:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:code.claude.com)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/on_stop.py"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/on_notification.py"
+          }
+        ]
+      }
+    ]
+  }
+}

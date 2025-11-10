@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# External Slack Listener Monitor
+# Detects Socket Mode event starvation and restarts slack_listener.py
+#
+# This script runs independently of slack_listener.py to avoid threading issues
+# that break Socket Mode event reception.
+
+set -e
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Environment variables (use /tmp for compatibility with original)
+LOG_FILE="/tmp/slack_listener.log"
+MONITOR_LOG="/tmp/slack_monitor.log"
+CHECK_INTERVAL=180  # Check every 3 minutes
+EVENT_TIMEOUT=300   # Restart if no events for 5 minutes
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$MONITOR_LOG"
+}
+
+log "========== SLACK MONITOR STARTING =========="
+log "Monitoring log: $LOG_FILE"
+log "Check interval: ${CHECK_INTERVAL}s"
+log "Event timeout: ${EVENT_TIMEOUT}s"
+
+while true; do
+    sleep $CHECK_INTERVAL
+
+    # Check if slack_listener.py is running
+    if ! pgrep -f "slack_listener.py" > /dev/null; then
+        log "WARNING: slack_listener.py not running, restarting..."
+        "${SCRIPT_DIR}/claude-slack-listener"
+        continue
+    fi
+
+    PID=$(pgrep -f "slack_listener.py")
+
+    # Check if log file exists
+    if [ ! -f "$LOG_FILE" ]; then
+        log "WARNING: Log file not found at $LOG_FILE"
+        continue
+    fi
+
+    # Find the most recent MESSAGE_EVENT timestamp
+    LAST_EVENT=$(grep -E "MESSAGE_EVENT" "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE "\[20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+\]" | tr -d '[]')
+
+    if [ -z "$LAST_EVENT" ]; then
+        log "No MESSAGE_EVENT found in logs yet"
+        continue
+    fi
+
+    # Convert timestamps to seconds since epoch
+    LAST_EVENT_SEC=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${LAST_EVENT:0:19}" "+%s" 2>/dev/null || echo "0")
+    NOW_SEC=$(date "+%s")
+    TIME_SINCE_EVENT=$((NOW_SEC - LAST_EVENT_SEC))
+
+    log "Last event: $LAST_EVENT (${TIME_SINCE_EVENT}s ago)"
+
+    # Check if event starvation detected
+    if [ $TIME_SINCE_EVENT -gt $EVENT_TIMEOUT ]; then
+        log "ALERT: Event starvation detected! No events for ${TIME_SINCE_EVENT}s"
+        log "Killing slack_listener.py PID $PID and restarting..."
+
+        pkill -f "slack_listener.py"
+        sleep 2
+
+        "${SCRIPT_DIR}/claude-slack-listener"
+
+        log "Restart completed"
+        log "⚠️  Note: You may need to @mention the bot once to wake up event reception"
+    fi
+done

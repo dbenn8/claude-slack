@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# Claude-Slack Health Check Script
+# Returns 0 if healthy, 1 if unhealthy
+# Provides detailed diagnostic output
+
+set -e
+
+# Get the script directory and set paths
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Environment variables
+SLACK_LOG_DIR=${SLACK_LOG_DIR:-"$HOME/.claude/slack/logs"}
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo "======================================="
+echo "Claude-Slack Health Check"
+echo "======================================="
+echo ""
+
+# Track overall health
+HEALTHY=true
+ISSUES=""
+
+# 1. Check if slack_listener.py is running
+echo -n "1. Checking slack_listener.py process... "
+if pgrep -f "slack_listener.py" > /dev/null; then
+    PID=$(pgrep -f "slack_listener.py")
+    echo -e "${GREEN}✓ Running (PID: $PID)${NC}"
+else
+    echo -e "${RED}✗ Not running${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - slack_listener.py is not running"
+fi
+
+# 2. Check for .env file
+echo -n "2. Checking .env file... "
+ENV_FILE="$INTEGRATION_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+else
+    echo -e "${RED}✗ Not found${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - .env file missing at $ENV_FILE"
+fi
+
+# 3. Check environment variables
+echo -n "3. Checking SLACK_BOT_TOKEN... "
+if [ -f "$ENV_FILE" ] && grep -q "SLACK_BOT_TOKEN=" "$ENV_FILE"; then
+    TOKEN_LINE=$(grep "SLACK_BOT_TOKEN=" "$ENV_FILE")
+    if [ -z "${TOKEN_LINE#*=}" ] || [ "${TOKEN_LINE#*=}" = '""' ]; then
+        echo -e "${RED}✗ Empty${NC}"
+        HEALTHY=false
+        ISSUES="${ISSUES}\n  - SLACK_BOT_TOKEN is empty in .env"
+    else
+        # Mask the token for security
+        TOKEN_START=$(echo "${TOKEN_LINE#*=}" | cut -c1-10)
+        echo -e "${GREEN}✓ Set (${TOKEN_START}...)${NC}"
+    fi
+else
+    echo -e "${RED}✗ Not found${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - SLACK_BOT_TOKEN not found in .env"
+fi
+
+echo -n "4. Checking SLACK_APP_TOKEN... "
+if [ -f "$ENV_FILE" ] && grep -q "SLACK_APP_TOKEN=" "$ENV_FILE"; then
+    TOKEN_LINE=$(grep "SLACK_APP_TOKEN=" "$ENV_FILE")
+    if [ -z "${TOKEN_LINE#*=}" ] || [ "${TOKEN_LINE#*=}" = '""' ]; then
+        echo -e "${RED}✗ Empty${NC}"
+        HEALTHY=false
+        ISSUES="${ISSUES}\n  - SLACK_APP_TOKEN is empty in .env"
+    else
+        # Mask the token for security
+        TOKEN_START=$(echo "${TOKEN_LINE#*=}" | cut -c1-10)
+        echo -e "${GREEN}✓ Set (${TOKEN_START}...)${NC}"
+    fi
+else
+    echo -e "${RED}✗ Not found${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - SLACK_APP_TOKEN not found in .env"
+fi
+
+# 4. Check registry database
+echo -n "5. Checking registry database... "
+if [ -f "$REGISTRY_DB_PATH" ]; then
+    # Check if we can query it
+    if sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions;" > /dev/null 2>&1; then
+        SESSION_COUNT=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions WHERE status='active';")
+        echo -e "${GREEN}✓ Accessible ($SESSION_COUNT active sessions)${NC}"
+    else
+        echo -e "${YELLOW}⚠ Found but cannot query${NC}"
+        ISSUES="${ISSUES}\n  - Registry database exists but may be corrupted"
+    fi
+else
+    echo -e "${RED}✗ Not found${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - Registry database missing at $REGISTRY_DB_PATH"
+fi
+
+# 5. Check for socket connections (if listener is running)
+echo -n "6. Checking Slack API connection... "
+if pgrep -f "slack_listener.py" > /dev/null; then
+    PID=$(pgrep -f "slack_listener.py")
+    # Check if the process has an established HTTPS connection (to Slack)
+    if lsof -p "$PID" 2>/dev/null | grep -q "TCP.*ESTABLISHED"; then
+        echo -e "${GREEN}✓ Connected${NC}"
+    else
+        echo -e "${YELLOW}⚠ Process running but no active connections${NC}"
+        ISSUES="${ISSUES}\n  - slack_listener.py may not be connected to Slack"
+    fi
+else
+    echo -e "${YELLOW}- Skipped (listener not running)${NC}"
+fi
+
+# 6.5. Event heartbeat check REMOVED
+# We removed the watchdog thread because threading breaks Socket Mode event reception
+# The heartbeat file is no longer created, so we skip this check
+echo -n "7. Checking event heartbeat... "
+echo -e "${YELLOW}⊘ Skipped (heartbeat feature removed - threading incompatible with Socket Mode)${NC}"
+
+# 7. Check for log file and recent activity
+echo -n "8. Checking listener logs... "
+LOG_FILES=("$SLACK_LOG_DIR/slack_listener.log")
+LOG_FOUND=false
+for LOG_FILE in "${LOG_FILES[@]}"; do
+    if [ -f "$LOG_FILE" ]; then
+        LOG_FOUND=true
+        # Check if log has been updated in last 5 minutes
+        if [ "$(find "$LOG_FILE" -mmin -5 2>/dev/null)" ]; then
+            echo -e "${GREEN}✓ Active log: $LOG_FILE${NC}"
+        else
+            LAST_MOD=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$LOG_FILE" 2>/dev/null || echo "unknown")
+            echo -e "${YELLOW}⚠ Log exists but stale (last: $LAST_MOD)${NC}"
+        fi
+        break
+    fi
+done
+
+if [ "$LOG_FOUND" = false ]; then
+    echo -e "${YELLOW}⚠ No log files found${NC}"
+fi
+
+# 8. Check for duplicate processes
+echo -n "9. Checking for duplicate processes... "
+LISTENER_COUNT=$(pgrep -f "slack_listener.py" | wc -l | tr -d ' ')
+if [ "$LISTENER_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}- No processes running${NC}"
+elif [ "$LISTENER_COUNT" -eq 1 ]; then
+    echo -e "${GREEN}✓ Single instance${NC}"
+else
+    echo -e "${RED}✗ Multiple instances ($LISTENER_COUNT)${NC}"
+    HEALTHY=false
+    ISSUES="${ISSUES}\n  - Multiple slack_listener.py processes running"
+fi
+
+echo ""
+echo "======================================="
+# Summary
+if [ "$HEALTHY" = true ]; then
+    echo -e "${GREEN}HEALTH CHECK: PASSED ✓${NC}"
+    echo "System appears to be functioning correctly"
+    exit 0
+else
+    echo -e "${RED}HEALTH CHECK: FAILED ✗${NC}"
+    echo ""
+    echo "Issues found:"
+    echo -e "$ISSUES"
+    echo ""
+    echo "To fix, run: claude-slack-listener"
+    exit 1
+fi

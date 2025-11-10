@@ -1,0 +1,220 @@
+#!/bin/bash
+
+# Claude-Slack Recovery Script
+# Attempts to automatically fix common issues
+
+set -e
+
+# Get the script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Environment variables
+SLACK_SOCKET_DIR=${SLACK_SOCKET_DIR:-"$HOME/.claude/slack/sockets"}
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+echo -e "${BOLD}======================================="
+echo "Claude-Slack Automatic Recovery"
+echo "$(date '+%Y-%m-%d %H:%M:%S')"
+echo "=======================================${NC}"
+echo ""
+
+# Track fixes applied
+FIXES_APPLIED=()
+FIXES_FAILED=()
+
+# Step 1: Run initial diagnostics
+echo -e "${CYAN}Step 1: Running initial diagnostics...${NC}"
+echo ""
+
+INITIAL_STATUS=0
+"${SCRIPT_DIR}/claude-slack-diagnose" || INITIAL_STATUS=$?
+
+if [ $INITIAL_STATUS -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}✅ System is already working!${NC}"
+    echo "No fixes needed."
+    exit 0
+fi
+
+echo ""
+echo -e "${YELLOW}Issues detected. Attempting automatic fixes...${NC}"
+echo ""
+
+# Step 2: Check for and fix common issues
+echo -e "${CYAN}Step 2: Applying fixes...${NC}"
+echo ""
+
+# Fix 1: Clean up zombie/duplicate processes
+echo -n "Checking for zombie processes... "
+LISTENER_COUNT=$(pgrep -f "slack_listener.py" | wc -l 2>/dev/null | tr -d ' ' || echo "0")
+if [ "$LISTENER_COUNT" -gt 1 ]; then
+    echo -e "${YELLOW}Found $LISTENER_COUNT instances${NC}"
+    echo "  Killing all slack_listener processes..."
+    pkill -f "slack_listener.py" 2>/dev/null || true
+    sleep 2
+    FIXES_APPLIED+=("Cleaned up duplicate slack_listener processes")
+    echo -e "  ${GREEN}✓ Cleaned${NC}"
+else
+    echo -e "${GREEN}✓ No duplicates${NC}"
+fi
+
+# Fix 2: Check for missing .env file
+echo -n "Checking .env file... "
+ENV_FILE="${CORE_DIR}/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    echo -e "${RED}✗ Missing${NC}"
+
+    # Check for example file
+    if [ -f "${ENV_FILE}.example" ]; then
+        echo "  Found .env.example"
+        echo -e "  ${YELLOW}Please create .env from .env.example and add your tokens${NC}"
+        FIXES_FAILED+=(".env file missing - manual configuration required")
+    else
+        echo -e "  ${RED}No .env or .env.example found${NC}"
+        echo ""
+        echo "  Please create ${ENV_FILE} with:"
+        echo "    SLACK_BOT_TOKEN=xoxb-..."
+        echo "    SLACK_APP_TOKEN=xapp-..."
+        FIXES_FAILED+=(".env file missing - manual configuration required")
+    fi
+else
+    echo -e "${GREEN}✓ Found${NC}"
+
+    # Check if tokens are present
+    MISSING_TOKENS=false
+    if ! grep -q "SLACK_BOT_TOKEN=" "$ENV_FILE" || [ -z "$(grep "SLACK_BOT_TOKEN=" "$ENV_FILE" | cut -d'=' -f2)" ]; then
+        echo -e "  ${RED}✗ SLACK_BOT_TOKEN missing or empty${NC}"
+        MISSING_TOKENS=true
+    fi
+    if ! grep -q "SLACK_APP_TOKEN=" "$ENV_FILE" || [ -z "$(grep "SLACK_APP_TOKEN=" "$ENV_FILE" | cut -d'=' -f2)" ]; then
+        echo -e "  ${RED}✗ SLACK_APP_TOKEN missing or empty${NC}"
+        MISSING_TOKENS=true
+    fi
+
+    if [ "$MISSING_TOKENS" = true ]; then
+        FIXES_FAILED+=("Slack tokens not configured in .env")
+    fi
+fi
+
+# Fix 3: Clean up stale socket files
+echo -n "Checking for stale sockets... "
+if [ -d "$SLACK_SOCKET_DIR" ]; then
+    # Find socket files older than 1 day
+    OLD_SOCKETS=$(find "$SLACK_SOCKET_DIR" -type s -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$OLD_SOCKETS" -gt 0 ]; then
+        echo -e "${YELLOW}Found $OLD_SOCKETS stale sockets${NC}"
+        find "$SLACK_SOCKET_DIR" -type s -mtime +1 -delete 2>/dev/null || true
+        FIXES_APPLIED+=("Cleaned up $OLD_SOCKETS stale socket files")
+        echo -e "  ${GREEN}✓ Cleaned${NC}"
+    else
+        echo -e "${GREEN}✓ None found${NC}"
+    fi
+else
+    echo -e "${GREEN}✓ Socket directory clean${NC}"
+fi
+
+# Fix 4: Start slack_listener if not running
+echo -n "Checking slack_listener... "
+if ! pgrep -f "slack_listener.py" >/dev/null 2>&1; then
+    echo -e "${YELLOW}Not running${NC}"
+
+    # Only try to start if we have valid configuration
+    if [ -f "$ENV_FILE" ] && grep -q "SLACK_BOT_TOKEN=" "$ENV_FILE" && grep -q "SLACK_APP_TOKEN=" "$ENV_FILE"; then
+        echo "  Starting slack_listener..."
+        if "${SCRIPT_DIR}/claude-slack-listener" >/dev/null 2>&1; then
+            FIXES_APPLIED+=("Started slack_listener.py")
+            echo -e "  ${GREEN}✓ Started${NC}"
+        else
+            echo -e "  ${RED}✗ Failed to start${NC}"
+            FIXES_FAILED+=("Could not start slack_listener.py")
+        fi
+    else
+        echo "  Cannot start - missing configuration"
+        FIXES_FAILED+=("Cannot start slack_listener without valid .env")
+    fi
+else
+    echo -e "${GREEN}✓ Already running${NC}"
+fi
+
+# Fix 5: Clean up excessive sessions in database
+echo -n "Checking session database... "
+if [ -f "$REGISTRY_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+    TOTAL_SESSIONS=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo "0")
+    if [ "$TOTAL_SESSIONS" -gt 100 ]; then
+        echo -e "${YELLOW}$TOTAL_SESSIONS sessions (cleaning old ones)${NC}"
+
+        # Mark sessions older than 7 days as inactive
+        OLD_COUNT=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions WHERE status='active' AND datetime(last_activity) < datetime('now', '-7 days');" 2>/dev/null || echo "0")
+        if [ "$OLD_COUNT" -gt 0 ]; then
+            sqlite3 "$REGISTRY_DB_PATH" "UPDATE sessions SET status='inactive' WHERE status='active' AND datetime(last_activity) < datetime('now', '-7 days');" 2>/dev/null || true
+            FIXES_APPLIED+=("Marked $OLD_COUNT old sessions as inactive")
+            echo -e "  ${GREEN}✓ Cleaned $OLD_COUNT old sessions${NC}"
+        fi
+    else
+        echo -e "${GREEN}✓ $TOTAL_SESSIONS sessions${NC}"
+    fi
+else
+    echo -e "${GREEN}✓ OK${NC}"
+fi
+
+echo ""
+
+# Step 3: Run diagnostics again
+echo -e "${CYAN}Step 3: Verifying fixes...${NC}"
+echo ""
+
+FINAL_STATUS=0
+"${SCRIPT_DIR}/claude-slack-diagnose" || FINAL_STATUS=$?
+
+echo ""
+echo -e "${CYAN}=======================================${NC}"
+echo -e "${BOLD}RECOVERY SUMMARY${NC}"
+echo -e "${CYAN}=======================================${NC}"
+
+# Report fixes applied
+if [ ${#FIXES_APPLIED[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${GREEN}Fixes Applied:${NC}"
+    for FIX in "${FIXES_APPLIED[@]}"; do
+        echo "  ✓ $FIX"
+    done
+fi
+
+# Report fixes that failed
+if [ ${#FIXES_FAILED[@]} -gt 0 ]; then
+    echo ""
+    echo -e "${RED}Manual Fixes Required:${NC}"
+    for FIX in "${FIXES_FAILED[@]}"; do
+        echo "  ✗ $FIX"
+    done
+fi
+
+# Final status
+echo ""
+if [ $FINAL_STATUS -eq 0 ]; then
+    echo -e "${GREEN}✅ RECOVERY SUCCESSFUL${NC}"
+    echo "System is now working!"
+else
+    if [ ${#FIXES_APPLIED[@]} -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  PARTIAL RECOVERY${NC}"
+        echo "Some fixes were applied but manual intervention is still required."
+    else
+        echo -e "${RED}❌ RECOVERY FAILED${NC}"
+        echo "Automatic recovery was not possible. Please check the issues above."
+    fi
+fi
+
+echo -e "${CYAN}=======================================${NC}"
+
+exit $FINAL_STATUS

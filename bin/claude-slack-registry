@@ -1,0 +1,56 @@
+#!/bin/bash
+#
+# Start Session Registry Service
+#
+# This service manages multiple concurrent Claude Code sessions
+# in Phase 2.5 multi-session mode.
+#
+# Usage:
+#   ./start-registry
+#
+# Press Ctrl+C to stop the service.
+#
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Environment variables
+SLACK_SOCKET_DIR=${SLACK_SOCKET_DIR:-"$HOME/.claude/slack/sockets"}
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+
+# Create required directories
+mkdir -p "$SLACK_SOCKET_DIR"
+mkdir -p "$(dirname "$REGISTRY_DB_PATH")"
+
+REGISTRY_PY="$CORE_DIR/session_registry.py"
+
+# Check if registry script exists
+if [ ! -f "$REGISTRY_PY" ]; then
+    echo "❌ Error: session_registry.py not found at $REGISTRY_PY"
+    echo "   Make sure you have Phase 2.5 files installed"
+    exit 1
+fi
+
+# Check if Python 3 is available
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Error: python3 not found"
+    echo "   Install Python 3.8 or higher"
+    exit 1
+fi
+
+# Display startup info
+echo "=========================================="
+echo "  Session Registry Service (Phase 2.5)"
+echo "=========================================="
+echo ""
+echo "🚀 Starting Session Registry..."
+echo ""
+echo "📡 Socket: $SLACK_SOCKET_DIR/registry.sock"
+echo "📁 Data:   $REGISTRY_DB_PATH"
+echo ""
+echo "   Press Ctrl+C to stop"
+echo ""
+
+# Run registry service
+exec python3 "$REGISTRY_PY"

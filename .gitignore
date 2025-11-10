@@ -1,0 +1,117 @@
+# Secrets and Environment Files
+.env
+.env.local
+.env.*.local
+*.env
+
+# Slack Tokens and Credentials
+*token*
+*secret*
+*credentials*
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+registry.db
+
+# Log Files
+*.log
+logs/
+*.log.*
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Backup Files
+*.backup
+*.bak
+*.old
+*.orig
+
+# Temporary Files
+/tmp/
+*.tmp
+.cache/
+
+# Unix Socket Files
+*.sock
+sockets/
+
+# Test Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build and Distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Documentation Build
+docs/_build/
+site/
+
+# Personal Notes
+TODO.txt
+NOTES.txt
+PERSONAL_*.md
+
+# Development/Migration Documentation (Contains Secrets)
+README_PHASE1.md
+QUICK_REFERENCE.txt
+SECRETS_AUDIT.txt
+README_AUDIT.txt
+PHASE1_COMPLETION_CHECKLIST.txt
+CROSS_REFERENCES.txt
+MIGRATION_MAP.txt
+PHASE1_INVENTORY_SUMMARY.txt
+PHASE2_COPY_SUMMARY.txt
+INDEX.txt
+HOOK_MYSTERY.md
+GIT_PREP_PLAN.md
+GIT_PREP_RESULTS.md
+slack_response.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk

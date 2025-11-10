@@ -1,0 +1,108 @@
+#!/bin/bash
+#
+# Start All Phase 2.5 Services
+#
+# This script starts both:
+# 1. Session Registry (manages multiple Claude sessions)
+# 2. Slack Bot (handles Slack communication)
+#
+# Usage:
+#   ./start-all
+#
+# Press Ctrl+C to stop all services.
+#
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Display banner
+echo "=========================================="
+echo "  Phase 2.5 Multi-Session Slack Control"
+echo "=========================================="
+echo ""
+
+# Check if Python 3 is available
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Error: python3 not found"
+    echo "   Install Python 3.8 or higher"
+    exit 1
+fi
+
+# Check if required files exist
+REQUIRED_FILES=(
+    "$CORE_DIR/session_registry.py"
+    "$CORE_DIR/slack_listener.py"
+)
+
+for file in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "$file" ]; then
+        echo "❌ Error: Required file not found: $(basename $file)"
+        echo "   Make sure you have all Phase 2.5 files installed"
+        exit 1
+    fi
+done
+
+# Check and load .env file
+if [ ! -f "$INTEGRATION_DIR/.env" ]; then
+    echo "⚠️  Warning: .env file not found at $INTEGRATION_DIR/.env"
+    echo "   Copy .env.example to .env and configure your tokens"
+    echo ""
+    read -p "Continue anyway? (y/n) " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+else
+    # Load environment variables from .env
+    set -a
+    source "$INTEGRATION_DIR/.env"
+    set +a
+fi
+
+# Environment variables for socket/db paths
+SLACK_SOCKET_DIR=${SLACK_SOCKET_DIR:-"$HOME/.claude/slack/sockets"}
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+SLACK_LOG_DIR=${SLACK_LOG_DIR:-"$HOME/.claude/slack/logs"}
+
+# Create required directories
+mkdir -p "$SLACK_SOCKET_DIR"
+mkdir -p "$(dirname "$REGISTRY_DB_PATH")"
+mkdir -p "$SLACK_LOG_DIR"
+
+# Start registry in background
+echo "1️⃣  Starting Session Registry..."
+python3 "$CORE_DIR/session_registry.py" &
+REGISTRY_PID=$!
+
+# Give registry time to start and initialize socket
+sleep 4
+
+# Check if registry started successfully
+if ! kill -0 $REGISTRY_PID 2>/dev/null; then
+    echo "❌ Registry failed to start"
+    exit 1
+fi
+
+echo "   ✅ Registry running (PID: $REGISTRY_PID)"
+echo "   📡 Socket: $SLACK_SOCKET_DIR/registry.sock"
+echo ""
+
+# Start Slack bot in foreground
+echo "2️⃣  Starting Slack Bot..."
+echo ""
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "👋 Shutting down services..."
+    kill $REGISTRY_PID 2>/dev/null
+    wait $REGISTRY_PID 2>/dev/null
+    echo "   ✅ All services stopped"
+}
+
+# Set trap to cleanup on exit
+trap cleanup EXIT INT TERM
+
+# Start Slack bot (runs in foreground)
+python3 "$CORE_DIR/slack_listener.py"

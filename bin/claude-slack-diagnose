@@ -1,0 +1,229 @@
+#!/bin/bash
+
+# Claude-Slack Diagnostic Script
+# Provides comprehensive system status and troubleshooting information
+
+# Get the script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+
+# Environment variables
+SLACK_LOG_DIR=${SLACK_LOG_DIR:-"$HOME/.claude/slack/logs"}
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+echo -e "${BOLD}======================================="
+echo "Claude-Slack System Diagnostics"
+echo "$(date '+%Y-%m-%d %H:%M:%S')"
+echo "=======================================${NC}"
+echo ""
+
+# Overall status
+OVERALL_STATUS="WORKING"
+ISSUES=()
+
+# 1. Process Status
+echo -e "${CYAN}1. PROCESS STATUS${NC}"
+echo "─────────────────────────────────"
+
+# Check slack_listener
+echo -n "  slack_listener.py: "
+LISTENER_PIDS=$(pgrep -f "slack_listener.py" 2>/dev/null || true)
+if [ -n "$LISTENER_PIDS" ]; then
+    COUNT=$(echo "$LISTENER_PIDS" | wc -l | tr -d ' ')
+    if [ "$COUNT" -eq 1 ]; then
+        echo -e "${GREEN}✓ Running (PID: $LISTENER_PIDS)${NC}"
+    else
+        echo -e "${YELLOW}⚠ Multiple instances ($COUNT)${NC}"
+        ISSUES+=("Multiple slack_listener instances")
+        for PID in $LISTENER_PIDS; do
+            echo "      - PID $PID"
+        done
+    fi
+else
+    echo -e "${RED}✗ Not running${NC}"
+    OVERALL_STATUS="BROKEN"
+    ISSUES+=("slack_listener.py not running")
+fi
+
+# Check claude sessions
+echo -n "  Claude sessions: "
+CLAUDE_COUNT=$(pgrep -f "claude.*--session-id" | wc -l 2>/dev/null | tr -d ' ' || echo "0")
+if [ "$CLAUDE_COUNT" -gt 0 ]; then
+    echo -e "${GREEN}$CLAUDE_COUNT active${NC}"
+else
+    echo -e "${YELLOW}None active${NC}"
+fi
+
+# Check session registry
+echo -n "  Session registry: "
+REGISTRY_PID=$(pgrep -f "session_registry.py" 2>/dev/null || true)
+if [ -n "$REGISTRY_PID" ]; then
+    echo -e "${GREEN}✓ Running (PID: $REGISTRY_PID)${NC}"
+else
+    echo -e "${YELLOW}○ Not running (optional)${NC}"
+fi
+
+echo ""
+
+# 2. Environment Status
+echo -e "${CYAN}2. ENVIRONMENT STATUS${NC}"
+echo "─────────────────────────────────"
+
+# Check .env file
+echo -n "  .env file: "
+ENV_FILE="${CORE_DIR}/.env"
+if [ -f "$ENV_FILE" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+
+    # Check tokens (without revealing them)
+    echo -n "  SLACK_BOT_TOKEN: "
+    if grep -q "SLACK_BOT_TOKEN=" "$ENV_FILE" && [ -n "$(grep "SLACK_BOT_TOKEN=" "$ENV_FILE" | cut -d'=' -f2)" ]; then
+        TOKEN=$(grep "SLACK_BOT_TOKEN=" "$ENV_FILE" | cut -d'=' -f2 | cut -c1-10)
+        echo -e "${GREEN}✓ Set (${TOKEN}...)${NC}"
+    else
+        echo -e "${RED}✗ Missing or empty${NC}"
+        OVERALL_STATUS="BROKEN"
+        ISSUES+=("SLACK_BOT_TOKEN not configured")
+    fi
+
+    echo -n "  SLACK_APP_TOKEN: "
+    if grep -q "SLACK_APP_TOKEN=" "$ENV_FILE" && [ -n "$(grep "SLACK_APP_TOKEN=" "$ENV_FILE" | cut -d'=' -f2)" ]; then
+        TOKEN=$(grep "SLACK_APP_TOKEN=" "$ENV_FILE" | cut -d'=' -f2 | cut -c1-10)
+        echo -e "${GREEN}✓ Set (${TOKEN}...)${NC}"
+    else
+        echo -e "${RED}✗ Missing or empty${NC}"
+        OVERALL_STATUS="BROKEN"
+        ISSUES+=("SLACK_APP_TOKEN not configured")
+    fi
+else
+    echo -e "${RED}✗ Not found${NC}"
+    OVERALL_STATUS="BROKEN"
+    ISSUES+=(".env file missing")
+fi
+
+echo ""
+
+# 3. Database Status
+echo -e "${CYAN}3. DATABASE STATUS${NC}"
+echo "─────────────────────────────────"
+
+echo -n "  Registry database: "
+if [ -f "$REGISTRY_DB_PATH" ]; then
+    echo -e "${GREEN}✓ Exists${NC}"
+
+    # Get session statistics
+    if command -v sqlite3 >/dev/null 2>&1; then
+        TOTAL_SESSIONS=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions;" 2>/dev/null || echo "?")
+        ACTIVE_SESSIONS=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions WHERE status='active';" 2>/dev/null || echo "?")
+        echo "    Total sessions: $TOTAL_SESSIONS"
+        echo "    Active sessions: $ACTIVE_SESSIONS"
+
+        # Show recent sessions
+        echo "    Recent sessions:"
+        sqlite3 "$REGISTRY_DB_PATH" "SELECT session_id, project, status, datetime(created_at, 'localtime') FROM sessions ORDER BY created_at DESC LIMIT 3;" 2>/dev/null | while IFS='|' read -r sid proj stat created; do
+            echo "      - $sid ($proj) - $stat - $created"
+        done
+    else
+        echo "    (sqlite3 not available for detailed info)"
+    fi
+else
+    echo -e "${YELLOW}○ Not found (will be created on first use)${NC}"
+fi
+
+echo ""
+
+# 4. Network Status
+echo -e "${CYAN}4. NETWORK STATUS${NC}"
+echo "─────────────────────────────────"
+
+if [ -n "$LISTENER_PIDS" ]; then
+    echo -n "  Slack API connection: "
+    # Check for established HTTPS connections
+    if lsof -p "$LISTENER_PIDS" 2>/dev/null | grep -q "TCP.*ESTABLISHED"; then
+        echo -e "${GREEN}✓ Connected${NC}"
+        CONNECTION_COUNT=$(lsof -p "$LISTENER_PIDS" 2>/dev/null | grep -c "TCP.*ESTABLISHED" || echo "0")
+        echo "    Active connections: $CONNECTION_COUNT"
+    else
+        echo -e "${YELLOW}⚠ No active connections${NC}"
+        ISSUES+=("No active Slack API connections")
+    fi
+else
+    echo "  Slack API connection: ${YELLOW}N/A (listener not running)${NC}"
+fi
+
+echo ""
+
+# 5. Log Files
+echo -e "${CYAN}5. LOG FILES${NC}"
+echo "─────────────────────────────────"
+
+LOG_FILES=(
+    "$SLACK_LOG_DIR/slack_listener.log"
+    "$SLACK_LOG_DIR/slack_listener_startup.log"
+    "$SLACK_LOG_DIR/ensure_listener.log"
+)
+
+for LOG in "${LOG_FILES[@]}"; do
+    echo -n "  $(basename "$LOG"): "
+    if [ -f "$LOG" ]; then
+        SIZE=$(du -h "$LOG" | cut -f1)
+        LAST_MOD=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$LOG" 2>/dev/null || echo "unknown")
+        echo -e "${GREEN}✓${NC} ($SIZE, last: $LAST_MOD)"
+
+        # Show last error if any
+        if grep -q "ERROR\|Error\|error" "$LOG" 2>/dev/null; then
+            LAST_ERROR=$(grep -i "error" "$LOG" | tail -1)
+            echo "    Last error: ${LAST_ERROR:0:60}..."
+        fi
+    else
+        echo -e "${YELLOW}○ Not found${NC}"
+    fi
+done
+
+echo ""
+
+# 6. Overall Summary
+echo -e "${CYAN}=======================================${NC}"
+echo -e "${BOLD}OVERALL STATUS: "
+
+if [ "$OVERALL_STATUS" = "WORKING" ]; then
+    if [ ${#ISSUES[@]} -eq 0 ]; then
+        echo -e "${GREEN}✅ SYSTEM WORKING${NC}"
+        echo "All components are functioning correctly."
+    else
+        echo -e "${YELLOW}⚠️  WORKING WITH WARNINGS${NC}"
+        echo ""
+        echo "Warnings:"
+        for ISSUE in "${ISSUES[@]}"; do
+            echo "  - $ISSUE"
+        done
+    fi
+else
+    echo -e "${RED}❌ SYSTEM BROKEN${NC}"
+    echo ""
+    echo "Critical Issues:"
+    for ISSUE in "${ISSUES[@]}"; do
+        echo "  - $ISSUE"
+    done
+    echo ""
+    echo "To fix: Run claude-slack-fix"
+fi
+
+echo -e "${CYAN}=======================================${NC}"
+
+# Return appropriate exit code
+if [ "$OVERALL_STATUS" = "WORKING" ]; then
+    exit 0
+else
+    exit 1
+fi

@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# Claude-Slack Launcher with Auto-Recovery
+# Ensures Slack listener is ready before starting Claude session
+# Installs Slack hooks in project directory if not present
+
+set -e
+
+# Get the script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CORE_DIR="$INTEGRATION_DIR/core"
+HOOKS_TEMPLATE_DIR="$INTEGRATION_DIR/hooks"
+
+# Detect project directory (current working directory)
+PROJECT_DIR="$(pwd)"
+PROJECT_HOOKS_DIR="$PROJECT_DIR/.claude/hooks"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Step 1: Ensure listener is ready
+echo -e "${BLUE}Checking Slack integration...${NC}"
+if ! "${SCRIPT_DIR}/claude-slack-ensure"; then
+    echo -e "${RED}✗ Failed to initialize Slack listener${NC}"
+    echo "Please check your .env configuration and try again."
+    exit 1
+fi
+
+# Step 2: Install Slack configuration in project directory (if needed)
+echo -e "${BLUE}Checking Slack configuration in project...${NC}"
+
+# Create .claude directory if it doesn't exist
+PROJECT_CLAUDE_DIR="$PROJECT_DIR/.claude"
+if [ ! -d "$PROJECT_CLAUDE_DIR" ]; then
+    echo -e "${YELLOW}Creating .claude directory...${NC}"
+    mkdir -p "$PROJECT_CLAUDE_DIR"
+fi
+
+# Create hooks directory if it doesn't exist
+if [ ! -d "$PROJECT_HOOKS_DIR" ]; then
+    echo -e "${YELLOW}Creating .claude/hooks directory...${NC}"
+    mkdir -p "$PROJECT_HOOKS_DIR"
+fi
+
+# Step 2a: Check and install settings.local.json
+PROJECT_SETTINGS="$PROJECT_CLAUDE_DIR/settings.local.json"
+TEMPLATE_SETTINGS="$HOOKS_TEMPLATE_DIR/settings.local.json.template"
+SETTINGS_NEEDS_UPDATE=false
+
+if [ ! -f "$PROJECT_SETTINGS" ]; then
+    echo -e "${YELLOW}  Installing settings.local.json...${NC}"
+    cp "$TEMPLATE_SETTINGS" "$PROJECT_SETTINGS"
+    echo -e "${GREEN}  ✓ settings.local.json installed${NC}"
+else
+    # Check if settings file has the required sections
+    if ! grep -q '"hooks"' "$PROJECT_SETTINGS" || ! grep -q '"permissions"' "$PROJECT_SETTINGS"; then
+        echo -e "${YELLOW}  Updating settings.local.json (missing hooks or permissions)...${NC}"
+        # Backup existing settings
+        cp "$PROJECT_SETTINGS" "$PROJECT_SETTINGS.backup"
+        cp "$TEMPLATE_SETTINGS" "$PROJECT_SETTINGS"
+        echo -e "${GREEN}  ✓ settings.local.json updated (backup saved)${NC}"
+    else
+        echo -e "${GREEN}  ✓ settings.local.json already configured${NC}"
+    fi
+fi
+
+# Step 2b: Install hook files
+HOOKS_TO_INSTALL=(
+    "on_stop.py"
+    "on_notification.py"
+)
+
+# Check and install each hook
+HOOKS_INSTALLED=0
+for hook in "${HOOKS_TO_INSTALL[@]}"; do
+    TEMPLATE_HOOK="$HOOKS_TEMPLATE_DIR/$hook"
+    PROJECT_HOOK="$PROJECT_HOOKS_DIR/$hook"
+
+    if [ ! -f "$PROJECT_HOOK" ]; then
+        # Hook doesn't exist, copy from template
+        echo -e "${YELLOW}  Installing $hook...${NC}"
+        cp "$TEMPLATE_HOOK" "$PROJECT_HOOK"
+        chmod +x "$PROJECT_HOOK"
+        HOOKS_INSTALLED=$((HOOKS_INSTALLED + 1))
+    else
+        echo -e "${GREEN}  ✓ $hook already installed${NC}"
+    fi
+done
+
+if [ $HOOKS_INSTALLED -gt 0 ]; then
+    echo -e "${GREEN}Installed $HOOKS_INSTALLED Slack hook file(s)${NC}"
+fi
+
+# Step 3: Wait a bit for full stabilization
+echo -e "${BLUE}Waiting for services to stabilize...${NC}"
+sleep 2
+
+# Step 4: Launch Claude with the hybrid wrapper
+echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
+echo ""
+
+# Pass all arguments through to the Python wrapper
+cd "$PROJECT_DIR"
+exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"

@@ -1,0 +1,47 @@
+#!/bin/bash
+# Quick health check for output receiver socket
+
+# Environment variables
+SLACK_SOCKET_DIR=${SLACK_SOCKET_DIR:-"$HOME/.claude/slack/sockets"}
+
+SOCKET_PATH="$SLACK_SOCKET_DIR/listener_output.sock"
+
+echo "🔍 Checking Output Receiver Socket"
+echo "=================================="
+echo
+
+# Check if socket exists
+if [ -S "$SOCKET_PATH" ]; then
+    echo "✅ Socket exists: $SOCKET_PATH"
+    ls -lh "$SOCKET_PATH"
+    echo
+
+    # Check age
+    echo "📅 Socket age:"
+    stat -f "Created: %SB" "$SOCKET_PATH" 2>/dev/null || stat -c "Created: %y" "$SOCKET_PATH" 2>/dev/null
+    echo
+
+    # Check permissions
+    echo "🔒 Permissions:"
+    ls -l "$SOCKET_PATH" | awk '{print $1}'
+    echo
+
+    # Check if anything is listening
+    echo "👂 Listening processes:"
+    lsof "$SOCKET_PATH" 2>/dev/null || echo "   (lsof not available or no processes found)"
+    echo
+
+    echo "✅ Socket is ready for connections"
+    echo
+    echo "Test with:"
+    echo "  echo '{\"session_id\":\"test\",\"output\":\"Hello\"}' | nc -U $SOCKET_PATH"
+
+elif [ -e "$SOCKET_PATH" ]; then
+    echo "⚠️  Path exists but is not a socket: $SOCKET_PATH"
+    ls -lh "$SOCKET_PATH"
+else
+    echo "❌ Socket does not exist: $SOCKET_PATH"
+    echo
+    echo "Make sure slack_listener_multi.py is running:"
+    echo "  python3 slack_listener_multi.py"
+fi
