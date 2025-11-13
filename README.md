@@ -207,6 +207,7 @@ sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
 │   ├── transcript_parser.py   # Parse Claude transcripts
 │   └── config.py              # Configuration management
 ├── hooks/                # Claude Code hook templates
+│   ├── on_pretooluse.py      # Permission requests with full context (NEW!)
 │   ├── on_stop.py            # Response completion hook
 │   ├── on_notification.py    # User notification hook
 │   └── settings.local.json.template
@@ -233,10 +234,36 @@ Contributions are welcome! Please:
 3. Test thoroughly
 4. Submit a pull request
 
+## Hooks Explained
+
+This integration uses three Claude Code hooks:
+
+### 1. **PreToolUse Hook** (on_pretooluse.py) - NEW! ✨
+- **Fires:** Before Claude executes any tool (Bash, Write, Edit, Read, etc.)
+- **Purpose:** Sends detailed permission requests to Slack with FULL context
+- **What you see:**
+  - Actual bash commands before execution
+  - File paths being written/edited/read
+  - Search patterns and parameters
+  - Everything Claude wants to do, before it happens
+- **Why it's important:** Allows you to make informed security decisions remotely
+
+### 2. **Notification Hook** (on_notification.py)
+- **Fires:** When Claude sends generic notifications (idle prompts, auth messages)
+- **Purpose:** Keeps you informed about Claude's status
+- **Note:** This hook has limited context by design (generic alerts only)
+
+### 3. **Stop Hook** (on_stop.py)
+- **Fires:** When Claude finishes generating a response
+- **Purpose:** Sends complete responses to Slack thread
+- **What you see:** Full AI responses with code, explanations, and context
+
 ## Known Limitations
 
 - Socket starvation issue requires @ mention workaround
-- Notifications from Claude (questions to the user with single digit answer shortcuts) aren't printing full content, only a single line.  We hope to tackle this soon.
+- ~~Notifications from Claude aren't printing full content~~ **SOLVED!** ✅
+  - PreToolUse hook now provides complete context for all permission requests
+  - See actual bash commands, file contents, and tool parameters before approving
 
 ## License
 

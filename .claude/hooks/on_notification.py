@@ -242,7 +242,7 @@ def enhance_notification_message(
         # Import transcript parser
         from transcript_parser import TranscriptParser
 
-        # For permission prompts, try to extract the specific tool name
+        # For permission prompts, extract tool details and add numbered options
         if notification_type == "permission_prompt" and os.path.exists(transcript_path):
             parser = TranscriptParser(transcript_path)
             if parser.load():
@@ -255,16 +255,48 @@ def enhance_notification_message(
                 if response and response.get('tool_calls'):
                     # Get the last tool call (the one waiting for permission)
                     last_tool = response['tool_calls'][-1]
-                    tool_name = last_tool.get('name', '')
+                    tool_name = last_tool.get('name', 'Unknown')
+                    tool_input = last_tool.get('input', {})
 
-                    # Format with emoji and tool details
-                    enhanced = f"⚠️ **Permission Required: {tool_name}**\n\n{message}"
+                    # Build detailed permission prompt
+                    enhanced = f"⚠️ **Permission Required: {tool_name}**\n\n"
 
-                    # Add a snippet of the tool's purpose if there's text
+                    # Add tool-specific details
+                    if tool_name == "Bash":
+                        command = tool_input.get('command', '')
+                        description = tool_input.get('description', '')
+                        if command:
+                            enhanced += f"**Command:** `{command}`\n"
+                        if description:
+                            enhanced += f"**Purpose:** {description}\n"
+                    elif tool_name == "Write":
+                        file_path = tool_input.get('file_path', '')
+                        if file_path:
+                            enhanced += f"**File:** `{file_path}`\n"
+                    elif tool_name == "Edit":
+                        file_path = tool_input.get('file_path', '')
+                        if file_path:
+                            enhanced += f"**File:** `{file_path}`\n"
+                    else:
+                        # For other tools, show first few input parameters
+                        if tool_input:
+                            params_str = str(tool_input)[:200]
+                            enhanced += f"**Parameters:** {params_str}\n"
+
+                    # Add context snippet if available
                     if response.get('text'):
                         snippet = response['text'][:200].strip()
                         if snippet:
-                            enhanced += f"\n\n_Context: {snippet}..._"
+                            enhanced += f"\n_Context: {snippet}..._\n"
+
+                    # Add numbered response options (matching Claude's 3-option permission system)
+                    enhanced += "\n**Reply with:**\n"
+                    enhanced += "1 - Approve this time\n"
+                    enhanced += "2 - Approve all " + tool_name + " for this session\n"
+                    enhanced += "3 - Deny\n"
+                else:
+                    # Fallback if no tool calls found
+                    enhanced = f"⚠️ {message}\n\n**Reply with:**\n1 - Approve this time\n2 - Approve all for this session\n3 - Deny"
 
         # For idle prompts, include context about what Claude last said
         elif notification_type == "idle_prompt" and os.path.exists(transcript_path):
@@ -366,6 +398,15 @@ def main():
         notification_message = hook_data.get("message")
         notification_type = hook_data.get("notification_type", "unknown")
         transcript_path = hook_data.get("transcript_path")
+
+        # Infer notification_type from message content if not provided
+        if notification_type == "unknown" and notification_message:
+            if "permission" in notification_message.lower():
+                notification_type = "permission_prompt"
+                debug_log("Inferred notification_type as permission_prompt from message content", "INPUT")
+            elif "idle" in notification_message.lower() or "waiting" in notification_message.lower():
+                notification_type = "idle_prompt"
+                debug_log("Inferred notification_type as idle_prompt from message content", "INPUT")
 
         debug_log(f"session_id: {session_id}", "INPUT")
         debug_log(f"notification_message: {notification_message}", "INPUT")

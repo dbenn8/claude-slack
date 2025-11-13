@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Claude Code Notification Hook - Post Notifications to Slack
+Claude Code Stop Hook - Post Assistant Responses to Slack
 
-Triggered when Claude sends notifications (permission requests, user choices, idle prompts).
-Extracts the notification message from hook input and posts it to Slack.
-
-This hook ensures that important prompts like numbered choices (1, 2, 3) and permission
-requests are sent to Slack so users can respond even when not at their terminal.
+Triggered when Claude finishes processing a user prompt.
+Reads the transcript, extracts the latest assistant response, and posts it to Slack.
 
 Hook Input (stdin):
     {
         "session_id": "abc12345",
         "transcript_path": "/path/to/transcript.jsonl",
-        "project_dir": "/path/to/project",
-        "hook_event_name": "Notification",
-        "message": "Claude needs your permission to use Write"
+        "project_dir": "/path/to/project"
     }
 
 Environment Variables:
@@ -28,14 +23,14 @@ Error Handling:
     - Splits long responses into multiple messages
 
 Architecture:
-    1. Read hook data from stdin (contains notification message)
-    2. Extract notification message from hook data
-    3. Query registry_db for session metadata (Slack thread info)
-    4. Post notification message to Slack thread
+    1. Read hook data from stdin
+    2. Parse transcript using transcript_parser
+    3. Query registry_db for session metadata
+    4. Post response to Slack thread
     5. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/notification_hook_debug.log
+    - All execution logged to /tmp/stop_hook_debug.log
     - Includes timestamps, session info, environment vars
     - Tracks hook lifecycle from entry to exit
 """
@@ -47,7 +42,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Debug log file path
-DEBUG_LOG = "/tmp/notification_hook_debug.log"
+DEBUG_LOG = "/tmp/stop_hook_debug.log"
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -76,10 +71,10 @@ def find_claude_slack_dir():
             return env_path
         else:
             # User explicitly set env var but it's wrong - show helpful error
-            print(f"[on_notification.py] ERROR: CLAUDE_SLACK_DIR is set to '{env_path}' but no claude-slack installation found there.", file=sys.stderr)
-            print(f"[on_notification.py] Either:", file=sys.stderr)
-            print(f"[on_notification.py]   1. Fix the path: export CLAUDE_SLACK_DIR=/correct/path/to/.claude/claude-slack", file=sys.stderr)
-            print(f"[on_notification.py]   2. Unset to allow auto-discovery: unset CLAUDE_SLACK_DIR", file=sys.stderr)
+            print(f"[on_stop.py] ERROR: CLAUDE_SLACK_DIR is set to '{env_path}' but no claude-slack installation found there.", file=sys.stderr)
+            print(f"[on_stop.py] Either:", file=sys.stderr)
+            print(f"[on_stop.py]   1. Fix the path: export CLAUDE_SLACK_DIR=/correct/path/to/.claude/claude-slack", file=sys.stderr)
+            print(f"[on_stop.py]   2. Unset to allow auto-discovery: unset CLAUDE_SLACK_DIR", file=sys.stderr)
             sys.exit(0)  # Don't block Claude
 
     # 2. Search upward from current directory (like git)
@@ -112,7 +107,7 @@ def debug_log(message: str, section: str = "GENERAL"):
             f.write(f"[{timestamp}] [{section}] {message}\n")
     except Exception as e:
         # If debug logging fails, log to stderr but don't crash
-        print(f"[on_notification.py] DEBUG LOG FAILED: {e}", file=sys.stderr)
+        print(f"[on_stop.py] DEBUG LOG FAILED: {e}", file=sys.stderr)
 
 
 # Log hook start immediately
@@ -130,7 +125,7 @@ if os.path.isdir(CORE_DIR):
 else:
     msg = f"WARNING: claude-slack core directory not found at {CORE_DIR}"
     debug_log(msg, "ERROR")
-    print(f"[on_notification.py] {msg}", file=sys.stderr)
+    print(f"[on_stop.py] {msg}", file=sys.stderr)
 
 # Load environment variables from .env file
 def load_env_file():
@@ -176,13 +171,13 @@ for key in ["SLACK_BOT_TOKEN", "REGISTRY_DATA_DIR", "CLAUDE_TRANSCRIPT_PATH"]:
 def log_error(message: str):
     """Log error to stderr (visible in Claude logs, doesn't block user)"""
     debug_log(f"ERROR: {message}", "ERROR")
-    print(f"[on_notification.py] ERROR: {message}", file=sys.stderr)
+    print(f"[on_stop.py] ERROR: {message}", file=sys.stderr)
 
 
 def log_info(message: str):
     """Log info to stderr"""
     debug_log(message, "INFO")
-    print(f"[on_notification.py] {message}", file=sys.stderr)
+    print(f"[on_stop.py] {message}", file=sys.stderr)
 
 
 def split_message(text: str, max_length: int = 39000) -> list:
@@ -216,82 +211,6 @@ def split_message(text: str, max_length: int = 39000) -> list:
         text = text[break_point:].lstrip('\n')
 
     return chunks
-
-
-def enhance_notification_message(
-    message: str,
-    notification_type: str,
-    transcript_path: str,
-    session_id: str
-) -> str:
-    """
-    Enhance notification message with additional context from transcript.
-
-    Args:
-        message: Base notification message from Claude Code
-        notification_type: Type of notification (permission_prompt, idle_prompt, etc.)
-        transcript_path: Path to session transcript
-        session_id: Claude session ID
-
-    Returns:
-        Enhanced message with formatting and context
-    """
-    enhanced = message
-
-    try:
-        # Import transcript parser
-        from transcript_parser import TranscriptParser
-
-        # For permission prompts, try to extract the specific tool name
-        if notification_type == "permission_prompt" and os.path.exists(transcript_path):
-            parser = TranscriptParser(transcript_path)
-            if parser.load():
-                # Get last assistant message
-                response = parser.get_latest_assistant_response(
-                    include_tool_calls=True,
-                    text_only=False
-                )
-
-                if response and response.get('tool_calls'):
-                    # Get the last tool call (the one waiting for permission)
-                    last_tool = response['tool_calls'][-1]
-                    tool_name = last_tool.get('name', '')
-
-                    # Format with emoji and tool details
-                    enhanced = f"⚠️ **Permission Required: {tool_name}**\n\n{message}"
-
-                    # Add a snippet of the tool's purpose if there's text
-                    if response.get('text'):
-                        snippet = response['text'][:200].strip()
-                        if snippet:
-                            enhanced += f"\n\n_Context: {snippet}..._"
-
-        # For idle prompts, include context about what Claude last said
-        elif notification_type == "idle_prompt" and os.path.exists(transcript_path):
-            parser = TranscriptParser(transcript_path)
-            if parser.load():
-                response = parser.get_latest_assistant_response()
-                if response and response.get('text'):
-                    snippet = response['text'][:300].strip()
-                    enhanced = f"⏰ **{message}**\n\n_Last message: {snippet}..._"
-                else:
-                    enhanced = f"⏰ {message}"
-
-        # For other notification types, just add emoji
-        elif notification_type == "auth_success":
-            enhanced = f"✅ {message}"
-        elif notification_type == "elicitation_dialog":
-            enhanced = f"❓ {message}"
-        else:
-            # Unknown type or no type - just pass through
-            enhanced = f"🔔 {message}"
-
-    except Exception as e:
-        # If enhancement fails, log it but return original message
-        debug_log(f"Failed to enhance notification: {e}", "ERROR")
-        enhanced = message
-
-    return enhanced
 
 
 def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
@@ -363,26 +282,73 @@ def main():
 
         # Extract hook parameters
         session_id = hook_data.get("session_id")
-        notification_message = hook_data.get("message")
-        notification_type = hook_data.get("notification_type", "unknown")
         transcript_path = hook_data.get("transcript_path")
+        project_dir = hook_data.get("project_dir")
 
         debug_log(f"session_id: {session_id}", "INPUT")
-        debug_log(f"notification_message: {notification_message}", "INPUT")
-        debug_log(f"notification_type: {notification_type}", "INPUT")
         debug_log(f"transcript_path: {transcript_path}", "INPUT")
+        debug_log(f"project_dir: {project_dir}", "INPUT")
 
         if not session_id:
             log_error("No session_id in hook data")
             sys.exit(0)
 
-        if not notification_message:
-            log_error("No notification message in hook data")
+        # Use transcript path from hook data, or construct from environment
+        if not transcript_path:
+            transcript_path = os.environ.get("CLAUDE_TRANSCRIPT_PATH")
+
+        if not transcript_path:
+            log_error("No transcript_path provided")
             sys.exit(0)
 
-        log_info(f"Processing notification for session {session_id[:8]}")
-        log_info(f"Notification type: {notification_type}")
-        log_info(f"Notification: {notification_message}")
+        log_info(f"Processing session {session_id[:8]}")
+
+        # Parse transcript
+        debug_log("Importing transcript_parser...", "TRANSCRIPT")
+        try:
+            from transcript_parser import TranscriptParser
+            debug_log("transcript_parser imported successfully", "TRANSCRIPT")
+        except ImportError as e:
+            log_error(f"transcript_parser module not found: {e}")
+            sys.exit(0)
+
+        debug_log(f"Creating TranscriptParser for: {transcript_path}", "TRANSCRIPT")
+        parser = TranscriptParser(transcript_path)
+
+        # Retry loading transcript (may not be flushed yet)
+        max_retries = 3
+        debug_log(f"Attempting to load transcript (max {max_retries} retries)...", "TRANSCRIPT")
+        for attempt in range(max_retries):
+            debug_log(f"Load attempt {attempt + 1}/{max_retries}", "TRANSCRIPT")
+            if parser.load():
+                debug_log("Transcript loaded successfully", "TRANSCRIPT")
+                break
+
+            if attempt < max_retries - 1:
+                import time
+                wait_time = 0.1 * (2 ** attempt)  # Exponential backoff: 100ms, 200ms, 400ms
+                log_info(f"Transcript not ready, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+        else:
+            log_error(f"Transcript file not found after {max_retries} retries: {transcript_path}")
+            sys.exit(0)
+
+        # Extract latest assistant response
+        debug_log("Extracting latest assistant response...", "TRANSCRIPT")
+        response = parser.get_latest_assistant_response(text_only=True)
+        debug_log(f"Response extracted: {response is not None}", "TRANSCRIPT")
+
+        if not response:
+            log_info("No assistant response with text found (tool-only response)")
+            sys.exit(0)
+
+        response_text = response['text']
+
+        if not response_text.strip():
+            log_info("Assistant response is empty")
+            sys.exit(0)
+
+        log_info(f"Extracted response: {len(response_text)} chars")
 
         # Query registry database for session metadata
         debug_log("Importing registry_db...", "REGISTRY")
@@ -468,19 +434,10 @@ def main():
             log_error("SLACK_BOT_TOKEN not set")
             sys.exit(0)
 
-        debug_log("Bot token found, enhancing notification message...", "SLACK")
+        debug_log("Bot token found, posting to Slack...", "SLACK")
 
-        # Enhance notification message with context
-        enhanced_message = enhance_notification_message(
-            notification_message,
-            notification_type,
-            transcript_path,
-            session_id
-        )
-        debug_log(f"Enhanced message (first 200 chars): {enhanced_message[:200]}", "SLACK")
-
-        # Post notification to Slack
-        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token)
+        # Post to Slack
+        success = post_to_slack(slack_channel, slack_thread_ts, response_text, bot_token)
 
         if success:
             log_info("Successfully posted to Slack")
