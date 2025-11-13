@@ -289,13 +289,14 @@ def enhance_notification_message(
                         if snippet:
                             enhanced += f"\n_Context: {snippet}..._\n"
 
-                    # Add numbered response options
+                    # Add numbered response options (matching Claude's 3-option permission system)
                     enhanced += "\n**Reply with:**\n"
-                    enhanced += "1 - Approve\n"
-                    enhanced += "2 - Deny\n"
+                    enhanced += "1 - Approve this time\n"
+                    enhanced += "2 - Approve all " + tool_name + " for this session\n"
+                    enhanced += "3 - Deny\n"
                 else:
                     # Fallback if no tool calls found
-                    enhanced = f"⚠️ {message}\n\n**Reply with:**\n1 - Approve\n2 - Deny"
+                    enhanced = f"⚠️ {message}\n\n**Reply with:**\n1 - Approve this time\n2 - Approve all for this session\n3 - Deny"
 
         # For idle prompts, include context about what Claude last said
         elif notification_type == "idle_prompt" and os.path.exists(transcript_path):
