@@ -47,10 +47,7 @@ def run_vibetunnel_mode(wrapper):
     wrapper.socket_thread.start()
 
     # Get Claude binary
-    try:
-        from core.config import get_claude_bin
-    except ModuleNotFoundError:
-        from config import get_claude_bin
+    from config import get_claude_bin
     claude_bin = get_claude_bin()
 
     # Generate session ID for Claude
