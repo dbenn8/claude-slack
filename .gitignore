@@ -115,3 +115,6 @@ slack_response.txt
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Claude Code local configuration (auto-managed by claude-slack)
+.claude/

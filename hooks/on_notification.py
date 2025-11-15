@@ -238,6 +238,12 @@ def parse_permission_prompt_from_output(output_bytes, session_id):
     """
     Parse exact permission prompt text from Claude's terminal output.
 
+    Uses smart heuristics to find the correct permission options:
+    1. Looks for permission-specific anchor keywords
+    2. Finds numbered lists AFTER the anchor
+    3. Validates options contain permission-like words
+    4. Takes FIRST valid match (not last)
+
     Args:
         output_bytes: Raw bytes from terminal output buffer
         session_id: Session ID for buffer file path
@@ -255,29 +261,100 @@ def parse_permission_prompt_from_output(output_bytes, session_id):
         debug_log(f"Parsing output buffer ({len(clean_text)} chars)", "PARSE")
         debug_log(f"Buffer preview: {clean_text[:200]}", "PARSE")
 
-        # Look for numbered options pattern
-        # Claude's format: "1. Option text\n2. Option text\n3. Option text"
         import re
 
-        # Try to find the permission prompt section
-        # Look for pattern like "1. Approve" or "1. Allow"
-        option_pattern = re.compile(r'^\s*(\d+)\.\s*(.+)$', re.MULTILINE)
-        matches = option_pattern.findall(clean_text)
+        # STEP 1: Find permission-specific anchor keywords
+        # These indicate we're in a permission prompt section
+        permission_anchors = [
+            r'needs permission',
+            r'permission to use',
+            r'wants to',
+            r'Choose an option',
+            r'Select one',
+        ]
 
-        if matches:
-            # Extract option texts (ignore the numbers)
-            options = [match[1].strip() for match in matches]
+        anchor_pos = -1
+        matched_anchor = None
+        for anchor in permission_anchors:
+            match = re.search(anchor, clean_text, re.IGNORECASE)
+            if match:
+                anchor_pos = match.start()
+                matched_anchor = anchor
+                debug_log(f"Found permission anchor '{anchor}' at position {anchor_pos}", "PARSE")
+                break
 
-            # Filter to only the last set of numbered options (most recent)
-            # Claude always shows 2-3 options, so take the last 2-3 matches
-            if len(options) >= 2:
-                # Take last 2-3 options (could be 2-option or 3-option prompt)
-                recent_options = options[-3:] if len(options) >= 3 else options[-2:]
+        # If no anchor found, search entire buffer (fallback)
+        search_text = clean_text[anchor_pos:] if anchor_pos >= 0 else clean_text
+        debug_log(f"Searching for options in {len(search_text)} chars after anchor", "PARSE")
 
-                debug_log(f"Found {len(recent_options)} permission options: {recent_options}", "PARSE")
-                return recent_options
+        # STEP 2: Find all numbered list patterns
+        # Match: "1. Some text" or "1) Some text"
+        option_pattern = re.compile(r'^\s*(\d+)[\.\)]\s*(.+)$', re.MULTILINE)
+        matches = option_pattern.findall(search_text)
 
-        debug_log("No permission options found in buffer", "PARSE")
+        if not matches:
+            debug_log("No numbered options found in buffer", "PARSE")
+            return None
+
+        debug_log(f"Found {len(matches)} total numbered items", "PARSE")
+
+        # STEP 3: Extract consecutive numbered lists (groups starting with 1)
+        # Permission prompts always start with "1."
+        option_groups = []
+        current_group = []
+
+        for num_str, text in matches:
+            num = int(num_str)
+            if num == 1:
+                # Start of new numbered list
+                if current_group:
+                    option_groups.append(current_group)
+                current_group = [text.strip()]
+            elif num == len(current_group) + 1:
+                # Continuation of current list (2 follows 1, 3 follows 2)
+                current_group.append(text.strip())
+            else:
+                # Non-sequential, end current group
+                if current_group:
+                    option_groups.append(current_group)
+                current_group = []
+
+        # Add final group
+        if current_group:
+            option_groups.append(current_group)
+
+        debug_log(f"Extracted {len(option_groups)} numbered list groups", "PARSE")
+
+        # STEP 4: Find the FIRST group that looks like permission options
+        # Permission options contain keywords like: approve, deny, allow, yes, no
+        permission_keywords = [
+            'approve', 'deny', 'allow', 'yes', 'no', 'reject',
+            'permit', 'grant', 'refuse', 'accept', 'decline'
+        ]
+
+        for i, group in enumerate(option_groups):
+            # Only consider groups with 2-3 options (Claude's permission format)
+            if len(group) < 2 or len(group) > 3:
+                debug_log(f"Group {i+1}: Skipping (wrong size: {len(group)} options)", "PARSE")
+                continue
+
+            # Check if options contain permission keywords
+            group_text = ' '.join(group).lower()
+            has_permission_keywords = any(keyword in group_text for keyword in permission_keywords)
+
+            if has_permission_keywords:
+                debug_log(f"Group {i+1}: MATCH! Found {len(group)} permission options: {group}", "PARSE")
+                return group
+            else:
+                debug_log(f"Group {i+1}: No permission keywords found in: {group[:100]}", "PARSE")
+
+        # STEP 5: Fallback - if no group matched keywords, take first 2-3 item group
+        for i, group in enumerate(option_groups):
+            if 2 <= len(group) <= 3:
+                debug_log(f"FALLBACK: Using group {i+1} ({len(group)} options): {group}", "PARSE")
+                return group
+
+        debug_log("No valid permission options found in buffer", "PARSE")
         return None
 
     except Exception as e:
@@ -538,6 +615,12 @@ def enhance_notification_message(
 
             if os.path.exists(buffer_file):
                 try:
+                    # Wait a brief moment to ensure buffer has complete prompt
+                    # Permission prompts may take 50-100ms to fully render in terminal
+                    import time
+                    time.sleep(0.075)  # 75ms delay for complete capture
+                    debug_log("Applied 75ms buffer read delay for complete capture", "ENHANCE")
+
                     with open(buffer_file, 'rb') as f:
                         buffer_content = f.read()
 

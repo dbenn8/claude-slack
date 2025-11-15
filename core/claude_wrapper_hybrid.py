@@ -432,8 +432,9 @@ class HybridPTYWrapper:
         self.channel = None
         self.claude_session_registered = False  # Track if Claude's UUID was registered
 
-        # Output buffer for capturing exact permission prompts (1KB ring buffer)
-        self.output_buffer = deque(maxlen=1024)
+        # Output buffer for capturing exact permission prompts (4KB ring buffer)
+        # Increased from 1KB to 4KB to capture all 3 permission options
+        self.output_buffer = deque(maxlen=4096)
         self.buffer_file = f"/tmp/claude_output_{session_id}.txt"
         self.buffer_lock = threading.Lock()
         self.logger.info(f"Output buffer initialized: {self.buffer_file}")
@@ -644,6 +645,10 @@ class HybridPTYWrapper:
                         print(f"{GREEN}[Session {self.session_id}] Claude session ID {claude_session_id[:8]} registered{RESET}", file=sys.stderr)
                         debug_log(f"Claude session registered with thread: {self.thread_ts}")
                         self.claude_session_registered = True  # Mark as registered
+
+                        # Update buffer file path to use Claude's UUID
+                        self.update_buffer_file_path(claude_session_id)
+
                         return True
                     else:
                         self.logger.error(f"Registration failed: {response.get('error', 'Unknown error')}")
@@ -787,6 +792,40 @@ class HybridPTYWrapper:
                 self.logger.debug("Output buffer cleared")
             except Exception as e:
                 self.logger.error(f"Failed to clear output buffer: {e}")
+
+    def update_buffer_file_path(self, claude_session_id):
+        """
+        Update buffer file path to use Claude's actual UUID session ID.
+
+        Args:
+            claude_session_id: Claude's full UUID session ID
+        """
+        old_buffer_file = self.buffer_file
+        new_buffer_file = f"/tmp/claude_output_{claude_session_id}.txt"
+
+        with self.buffer_lock:
+            try:
+                # Copy existing buffer data to new file if old file exists
+                if os.path.exists(old_buffer_file):
+                    with open(old_buffer_file, 'rb') as old_f:
+                        data = old_f.read()
+                    with open(new_buffer_file, 'wb') as new_f:
+                        new_f.write(data)
+                    # Remove old file
+                    os.remove(old_buffer_file)
+                    self.logger.info(f"Moved buffer file: {old_buffer_file} -> {new_buffer_file}")
+                else:
+                    # Create new file
+                    with open(new_buffer_file, 'wb') as f:
+                        f.write(bytes(self.output_buffer))
+                    self.logger.info(f"Created new buffer file: {new_buffer_file}")
+
+                # Update buffer file path
+                self.buffer_file = new_buffer_file
+                self.logger.info(f"Buffer file path updated to use Claude session ID: {claude_session_id[:8]}")
+
+            except Exception as e:
+                self.logger.error(f"Failed to update buffer file path: {e}")
 
     def cleanup(self):
         """Clean up resources"""

@@ -238,6 +238,12 @@ def parse_permission_prompt_from_output(output_bytes, session_id):
     """
     Parse exact permission prompt text from Claude's terminal output.
 
+    Uses smart heuristics to find the correct permission options:
+    1. Looks for permission-specific anchor keywords
+    2. Finds numbered lists AFTER the anchor
+    3. Validates options contain permission-like words
+    4. Takes FIRST valid match (not last)
+
     Args:
         output_bytes: Raw bytes from terminal output buffer
         session_id: Session ID for buffer file path
@@ -255,29 +261,138 @@ def parse_permission_prompt_from_output(output_bytes, session_id):
         debug_log(f"Parsing output buffer ({len(clean_text)} chars)", "PARSE")
         debug_log(f"Buffer preview: {clean_text[:200]}", "PARSE")
 
-        # Look for numbered options pattern
-        # Claude's format: "1. Option text\n2. Option text\n3. Option text"
         import re
 
-        # Try to find the permission prompt section
-        # Look for pattern like "1. Approve" or "1. Allow"
-        option_pattern = re.compile(r'^\s*(\d+)\.\s*(.+)$', re.MULTILINE)
-        matches = option_pattern.findall(clean_text)
+        # STEP 1: Find permission-specific anchor keywords
+        # These indicate we're in a permission prompt section
+        permission_anchors = [
+            r'needs permission',
+            r'permission to use',
+            r'wants to',
+            r'Choose an option',
+            r'Select one',
+        ]
 
-        if matches:
-            # Extract option texts (ignore the numbers)
-            options = [match[1].strip() for match in matches]
+        anchor_pos = -1
+        matched_anchor = None
+        for anchor in permission_anchors:
+            match = re.search(anchor, clean_text, re.IGNORECASE)
+            if match:
+                anchor_pos = match.start()
+                matched_anchor = anchor
+                debug_log(f"Found permission anchor '{anchor}' at position {anchor_pos}", "PARSE")
+                break
 
-            # Filter to only the last set of numbered options (most recent)
-            # Claude always shows 2-3 options, so take the last 2-3 matches
-            if len(options) >= 2:
-                # Take last 2-3 options (could be 2-option or 3-option prompt)
-                recent_options = options[-3:] if len(options) >= 3 else options[-2:]
+        # If no anchor found, search entire buffer (fallback)
+        search_text = clean_text[anchor_pos:] if anchor_pos >= 0 else clean_text
+        debug_log(f"Searching for options in {len(search_text)} chars after anchor", "PARSE")
 
-                debug_log(f"Found {len(recent_options)} permission options: {recent_options}", "PARSE")
-                return recent_options
+        # STEP 2: Find all numbered list patterns
+        # Match: "1. Some text" or "1) Some text"
+        option_pattern = re.compile(r'^\s*(\d+)[\.\)]\s*(.+)$', re.MULTILINE)
+        matches = option_pattern.findall(search_text)
 
-        debug_log("No permission options found in buffer", "PARSE")
+        if not matches:
+            debug_log("No numbered options found in buffer", "PARSE")
+            return None
+
+        debug_log(f"Found {len(matches)} total numbered items", "PARSE")
+        # Log what we found for debugging
+        for num_str, text in matches:
+            debug_log(f"  Item {num_str}: {text[:80]}", "PARSE")
+
+        # STEP 3: Extract consecutive numbered lists
+        # Permission prompts may start with any number (1, 2, 3) if option 1 scrolled off
+        # Track metadata: (group, starting_number)
+        option_groups = []
+        current_group = []
+        current_start_num = None
+        expected_next = None
+
+        for num_str, text in matches:
+            num = int(num_str)
+
+            if expected_next is None:
+                # Start of new numbered list (can be any starting number)
+                if current_group:
+                    option_groups.append((current_group, current_start_num))
+                current_group = [text.strip()]
+                current_start_num = num
+                expected_next = num + 1
+            elif num == expected_next:
+                # Continuation of current list (consecutive)
+                current_group.append(text.strip())
+                expected_next = num + 1
+            else:
+                # Non-consecutive, end current group and start new one
+                if current_group:
+                    option_groups.append((current_group, current_start_num))
+                current_group = [text.strip()]
+                current_start_num = num
+                expected_next = num + 1
+
+        # Add final group
+        if current_group:
+            option_groups.append((current_group, current_start_num))
+
+        debug_log(f"Extracted {len(option_groups)} numbered list groups", "PARSE")
+
+        # STEP 4: Find the FIRST group that looks like permission options
+        # Permission options contain keywords like: approve, deny, allow, yes, no
+        permission_keywords = [
+            'approve', 'deny', 'allow', 'yes', 'no', 'reject',
+            'permit', 'grant', 'refuse', 'accept', 'decline'
+        ]
+
+        for i, (group, start_num) in enumerate(option_groups):
+            # Only consider groups with 2-3 options (Claude's permission format)
+            if len(group) < 2 or len(group) > 3:
+                debug_log(f"Group {i+1}: Skipping (wrong size: {len(group)} options)", "PARSE")
+                continue
+
+            # Check if options contain permission keywords
+            group_text = ' '.join(group).lower()
+            has_permission_keywords = any(keyword in group_text for keyword in permission_keywords)
+
+            if has_permission_keywords:
+                debug_log(f"Group {i+1}: MATCH! Found {len(group)} permission options starting at #{start_num}: {group}", "PARSE")
+
+                # STEP 4A: Reconstruct missing option 1 if needed
+                if start_num == 2:
+                    # Missing option 1 - prepend standard text
+                    reconstructed = ["Approve this time"] + group
+                    debug_log(f"Reconstructed option 1: Added 'Approve this time' before captured options", "PARSE")
+                    return reconstructed
+                elif start_num == 3:
+                    # Missing options 1 and 2 - prepend both
+                    # This shouldn't happen often, but handle it
+                    reconstructed = ["Approve this time", "Approve commands like this for this project"] + group
+                    debug_log(f"Reconstructed options 1 & 2: Added standard text before captured option", "PARSE")
+                    return reconstructed
+                else:
+                    # Has all options or starts with 1
+                    return group
+            else:
+                debug_log(f"Group {i+1}: No permission keywords found in: {group[:100]}", "PARSE")
+
+        # STEP 5: Fallback - if no group matched keywords, take first 2-3 item group
+        for i, (group, start_num) in enumerate(option_groups):
+            if 2 <= len(group) <= 3:
+                debug_log(f"FALLBACK: Using group {i+1} ({len(group)} options) starting at #{start_num}: {group}", "PARSE")
+
+                # Still reconstruct missing option 1 even in fallback
+                if start_num == 2:
+                    reconstructed = ["Approve this time"] + group
+                    debug_log(f"FALLBACK: Reconstructed option 1", "PARSE")
+                    return reconstructed
+                elif start_num == 3:
+                    reconstructed = ["Approve this time", "Approve commands like this for this project"] + group
+                    debug_log(f"FALLBACK: Reconstructed options 1 & 2", "PARSE")
+                    return reconstructed
+                else:
+                    return group
+
+        debug_log("No valid permission options found in buffer", "PARSE")
         return None
 
     except Exception as e:
@@ -538,6 +653,12 @@ def enhance_notification_message(
 
             if os.path.exists(buffer_file):
                 try:
+                    # NO DELAY - read buffer immediately
+                    # Testing shows delays cause buffer to be cleared by UI updates
+                    # import time
+                    # time.sleep(0.075)  # REMOVED: Delay causes buffer to be empty
+                    debug_log("Reading buffer immediately (no delay)", "ENHANCE")
+
                     with open(buffer_file, 'rb') as f:
                         buffer_content = f.read()
 
