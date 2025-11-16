@@ -137,13 +137,23 @@ def run_vibetunnel_mode(wrapper):
                 # Check Slack queue
                 try:
                     slack_data = wrapper.slack_input_queue.get(timeout=0.5)
-                    # Write to terminal - Claude will read it
-                    # Use ioctl to inject into terminal input buffer
+                    # Inject using two-step pattern: text, sleep, Enter
+                    # Matches standard mode pattern for consistency
                     import fcntl
                     import termios as term
+                    import time
+
+                    # Step 1: Inject text bytes
                     for byte in slack_data:
                         fcntl.ioctl(sys.stdin, term.TIOCSTI, bytes([byte]))
-                    wrapper.logger.info(f"Injected {len(slack_data)} bytes to terminal")
+                    wrapper.logger.debug(f"Injected {len(slack_data)} bytes to terminal")
+
+                    # Step 2: Sleep (give terminal time to process)
+                    time.sleep(0.1)
+
+                    # Step 3: Inject Enter key (CR)
+                    fcntl.ioctl(sys.stdin, term.TIOCSTI, b'\r')
+                    wrapper.logger.info(f"Input injected with Enter key ({len(slack_data)} bytes + CR)")
                 except queue.Empty:
                     pass
 
