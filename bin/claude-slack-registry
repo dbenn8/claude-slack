@@ -15,7 +15,16 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CORE_DIR="$INTEGRATION_DIR/core"
 
-# Environment variables
+# Load environment variables from .env file
+ENV_FILE="$INTEGRATION_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    # Export variables from .env (skip comments and empty lines)
+    set -a
+    source "$ENV_FILE"
+    set +a
+fi
+
+# Environment variables (with defaults)
 SLACK_SOCKET_DIR=${SLACK_SOCKET_DIR:-"$HOME/.claude/slack/sockets"}
 REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
 

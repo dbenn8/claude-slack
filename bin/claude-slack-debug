@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# Claude-Slack Debug Tool
+# Run this in VibeTunnel to diagnose display issues
+
+set -e
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+echo "=== Claude-Slack Debug Information ==="
+echo ""
+echo "1. Environment Detection"
+echo "  VIBETUNNEL_SESSION_ID: ${VIBETUNNEL_SESSION_ID:-NOT SET}"
+echo "  TERM: ${TERM:-NOT SET}"
+echo "  TERM_PROGRAM: ${TERM_PROGRAM:-NOT SET}"
+echo "  COLUMNS: ${COLUMNS:-NOT SET}"
+echo "  LINES: ${LINES:-NOT SET}"
+echo ""
+
+echo "2. Terminal Size (from stty)"
+if command -v stty &> /dev/null; then
+    stty size 2>/dev/null || echo "  stty not available"
+else
+    echo "  stty command not found"
+fi
+echo ""
+
+echo "3. Mode Files"
+MODE_FILES=(/tmp/vibetunnel_mode_*.txt)
+if [ -f "${MODE_FILES[0]}" ]; then
+    for f in "${MODE_FILES[@]}"; do
+        echo "  $f: $(cat "$f" 2>/dev/null || echo "ERROR")"
+    done
+else
+    echo "  No mode files found"
+fi
+echo ""
+
+echo "4. Latest Wrapper Log"
+LOG_DIR="${HOME}/.local/share/claude-code-integration/logs"
+LATEST_LOG=$(ls -t "$LOG_DIR"/wrapper_*.log 2>/dev/null | head -1)
+if [ -n "$LATEST_LOG" ]; then
+    echo "  Log: $LATEST_LOG"
+    echo ""
+    echo "  Last 30 VibeTunnel/Mode entries:"
+    grep -E "vibetunnel|mode|Mode|VibeTunnel" "$LATEST_LOG" | tail -30
+else
+    echo "  No wrapper logs found in $LOG_DIR"
+fi
+echo ""
+
+echo "5. Active Sessions"
+SOCKET_DIR="${HOME}/.local/share/claude-code-integration/sockets"
+if [ -d "$SOCKET_DIR" ]; then
+    echo "  Sockets in $SOCKET_DIR:"
+    ls -lh "$SOCKET_DIR"/*.sock 2>/dev/null || echo "  No active sessions"
+else
+    echo "  Socket directory not found"
+fi
+echo ""
+
+echo "6. Testing ANSI Escape Codes"
+echo "  This should appear in color:"
+echo -e "  \033[31mRED\033[0m \033[32mGREEN\033[0m \033[33mYELLOW\033[0m \033[34mBLUE\033[0m"
+echo ""
+echo "  This should be bold:"
+echo -e "  \033[1mBOLD TEXT\033[0m"
+echo ""
+
+echo "=== Debug Complete ==="

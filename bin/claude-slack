@@ -34,6 +34,26 @@ fi
 # Step 2: Install Slack configuration in project directory (if needed)
 echo -e "${BLUE}Checking Slack configuration in project...${NC}"
 
+# Step 2a: Ensure .claude/ is in .gitignore (prevent stash conflicts)
+PROJECT_GITIGNORE="$PROJECT_DIR/.gitignore"
+if [ -f "$PROJECT_GITIGNORE" ]; then
+    if ! grep -q "^\.claude/" "$PROJECT_GITIGNORE" && ! grep -q "^\.claude$" "$PROJECT_GITIGNORE"; then
+        echo -e "${YELLOW}Adding .claude/ to .gitignore...${NC}"
+        echo "" >> "$PROJECT_GITIGNORE"
+        echo "# Claude Code local configuration (auto-managed by claude-slack)" >> "$PROJECT_GITIGNORE"
+        echo ".claude/" >> "$PROJECT_GITIGNORE"
+        echo -e "${GREEN}  ✓ .claude/ added to .gitignore${NC}"
+    else
+        echo -e "${GREEN}  ✓ .claude/ already in .gitignore${NC}"
+    fi
+else
+    # No .gitignore exists, create one with .claude/
+    echo -e "${YELLOW}Creating .gitignore with .claude/...${NC}"
+    echo "# Claude Code local configuration (auto-managed by claude-slack)" > "$PROJECT_GITIGNORE"
+    echo ".claude/" >> "$PROJECT_GITIGNORE"
+    echo -e "${GREEN}  ✓ .gitignore created${NC}"
+fi
+
 # Create .claude directory if it doesn't exist
 PROJECT_CLAUDE_DIR="$PROJECT_DIR/.claude"
 if [ ! -d "$PROJECT_CLAUDE_DIR" ]; then
@@ -73,6 +93,7 @@ fi
 HOOKS_TO_INSTALL=(
     "on_stop.py"
     "on_notification.py"
+    "on_pretooluse.py"
 )
 
 # Check and install each hook

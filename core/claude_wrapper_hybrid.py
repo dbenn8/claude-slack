@@ -38,6 +38,7 @@ import select
 import termios
 import tty
 import socket
+import signal
 import threading
 import time
 import argparse
@@ -45,9 +46,12 @@ import hashlib
 import json
 import logging
 import logging.handlers
+import fcntl
+import struct
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from collections import deque
 
 # Load environment variables from .env file (in parent directory)
 env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
@@ -409,6 +413,11 @@ class HybridPTYWrapper:
         self.logger.info(f"Claude args: {claude_args}")
         self.logger.info(f"Python version: {sys.version}")
         self.logger.info(f"Working directory: {os.getcwd()}")
+
+        # VibeTunnel detection
+        if self.is_vibetunnel():
+            self.logger.info("VibeTunnel detected - will use no-PTY mode")
+
         self.logger.info("="*60)
 
         # Session-specific socket
@@ -430,6 +439,13 @@ class HybridPTYWrapper:
         self.thread_ts = None
         self.channel = None
         self.claude_session_registered = False  # Track if Claude's UUID was registered
+
+        # Output buffer for capturing exact permission prompts (4KB ring buffer)
+        # Increased from 1KB to 4KB to capture all 3 permission options
+        self.output_buffer = deque(maxlen=4096)
+        self.buffer_file = f"/tmp/claude_output_{session_id}.txt"
+        self.buffer_lock = threading.Lock()
+        self.logger.info(f"Output buffer initialized: {self.buffer_file}")
 
     def setup_socket_directory(self):
         """Create socket directory if it doesn't exist"""
@@ -637,6 +653,10 @@ class HybridPTYWrapper:
                         print(f"{GREEN}[Session {self.session_id}] Claude session ID {claude_session_id[:8]} registered{RESET}", file=sys.stderr)
                         debug_log(f"Claude session registered with thread: {self.thread_ts}")
                         self.claude_session_registered = True  # Mark as registered
+
+                        # Update buffer file path to use Claude's UUID
+                        self.update_buffer_file_path(claude_session_id)
+
                         return True
                     else:
                         self.logger.error(f"Registration failed: {response.get('error', 'Unknown error')}")
@@ -692,17 +712,20 @@ class HybridPTYWrapper:
                                 self.logger.info("First message received - retrying Claude session registration")
                                 self.register_claude_session(self.claude_session_uuid)
 
-                        # Inject into Claude's stdin by writing to master pty
-                        # First write the text
-                        bytes_written = os.write(self.master_fd, data.encode('utf-8'))
-                        self.logger.debug(f"Wrote {bytes_written} bytes to PTY master")
-
-                        # Small delay to let text settle
-                        time.sleep(0.1)
-
-                        # Then send Enter key (carriage return)
-                        os.write(self.master_fd, b'\r')
-                        self.logger.info("Input injected successfully with Enter key")
+                        # Inject into Claude's stdin
+                        # VibeTunnel mode: use queue (no PTY)
+                        if hasattr(self, 'slack_input_queue'):
+                            # VibeTunnel mode - queue just the text (Enter added in two-step pattern)
+                            # Matches standard mode: text, sleep, \r
+                            self.slack_input_queue.put(data.encode('utf-8'))
+                            self.logger.info("Input queued for VibeTunnel mode")
+                        else:
+                            # Standard mode - write to PTY
+                            bytes_written = os.write(self.master_fd, data.encode('utf-8'))
+                            self.logger.debug(f"Wrote {bytes_written} bytes to PTY master")
+                            time.sleep(0.1)
+                            os.write(self.master_fd, b'\r')
+                            self.logger.info("Input injected successfully with Enter key")
 
                         debug_log("Input injected successfully")
 
@@ -713,6 +736,44 @@ class HybridPTYWrapper:
 
         self.logger.info("Socket listener thread ending")
 
+    def is_vibetunnel(self):
+        """Check if running in VibeTunnel environment"""
+        return 'VIBETUNNEL_SESSION_ID' in os.environ
+
+    def handle_window_size_change(self, signum, frame):
+        """Signal handler for terminal window size changes (SIGWINCH)"""
+        if self.master_fd is None:
+            return
+
+        try:
+            # Get current terminal size
+            size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+            rows, cols = size[0], size[1]
+            
+            # Update PTY size to match
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+            
+            self.logger.debug(f"Window size updated: {cols}x{rows}")
+        except Exception as e:
+            self.logger.error(f"Error updating window size: {e}")
+
+    def sync_window_size(self):
+        """Synchronize PTY window size with current terminal size"""
+        if self.master_fd is None:
+            return
+
+        try:
+            # Get current terminal size
+            size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+            rows, cols = size[0], size[1]
+            
+            # Set PTY size to match
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+            
+            self.logger.info(f"Initial PTY size set to: {cols}x{rows}")
+        except Exception as e:
+            self.logger.error(f"Error setting initial PTY size: {e}")
+
     def print_startup_banner(self):
         """Print startup banner with session information"""
         separator = "─" * 50
@@ -722,6 +783,8 @@ class HybridPTYWrapper:
         print(f"{CYAN}Session ID: {BOLD}{self.session_id}{RESET}", file=sys.stderr)
         print(f"{CYAN}Project: {self.project_dir}{RESET}", file=sys.stderr)
         print(f"{CYAN}Input Socket: {self.socket_path}{RESET}", file=sys.stderr)
+        if self.is_vibetunnel():
+            print(f"{YELLOW}VibeTunnel: Using No-PTY mode{RESET}", file=sys.stderr)
         print(f"{GREEN}Hooks will handle output streaming to Slack{RESET}", file=sys.stderr)
         print(f"{BOLD}{CYAN}{separator}{RESET}\n", file=sys.stderr)
 
@@ -735,6 +798,13 @@ class HybridPTYWrapper:
 
     def enter_alternate_screen(self):
         """Enter alternate screen buffer (like vim/less)"""
+        # SOLUTION 1: Disable alternate screen for VibeTunnel
+        # VibeTunnel's xterm.js can handle Claude's output natively
+        # Nested PTY alternate screen management causes artifacts
+        if self.is_vibetunnel():
+            self.logger.info("Skipping alternate screen buffer (VibeTunnel compatibility)")
+            return
+        
         if self.supports_alternate_screen():
             sys.stdout.write('\x1b[?1049h')  # Enter alternate screen
             sys.stdout.write('\x1b[2J')       # Clear screen
@@ -745,11 +815,79 @@ class HybridPTYWrapper:
 
     def exit_alternate_screen(self):
         """Exit alternate screen buffer"""
+        # Skip for VibeTunnel (matches enter_alternate_screen behavior)
+        if self.is_vibetunnel():
+            return
+            
         if self.using_alternate_screen:
             sys.stdout.write('\x1b[?1049l')  # Exit alternate screen
             sys.stdout.flush()
             self.using_alternate_screen = False
             self.logger.info("Exited alternate screen buffer")
+
+    def add_to_output_buffer(self, data):
+        """
+        Add output data to ring buffer and write to file.
+
+        Args:
+            data: Bytes to add to buffer
+        """
+        with self.buffer_lock:
+            # Add to ring buffer (automatically drops oldest if full)
+            self.output_buffer.extend(data)
+
+            # Write entire buffer to file for notification hook to read
+            try:
+                with open(self.buffer_file, 'wb') as f:
+                    f.write(bytes(self.output_buffer))
+            except Exception as e:
+                self.logger.error(f"Failed to write output buffer: {e}")
+
+    def clear_output_buffer(self):
+        """Clear the output buffer (called by notification hook after successful parse)"""
+        with self.buffer_lock:
+            self.output_buffer.clear()
+            try:
+                # Truncate file
+                with open(self.buffer_file, 'wb') as f:
+                    pass  # Empty file
+                self.logger.debug("Output buffer cleared")
+            except Exception as e:
+                self.logger.error(f"Failed to clear output buffer: {e}")
+
+    def update_buffer_file_path(self, claude_session_id):
+        """
+        Update buffer file path to use Claude's actual UUID session ID.
+
+        Args:
+            claude_session_id: Claude's full UUID session ID
+        """
+        old_buffer_file = self.buffer_file
+        new_buffer_file = f"/tmp/claude_output_{claude_session_id}.txt"
+
+        with self.buffer_lock:
+            try:
+                # Copy existing buffer data to new file if old file exists
+                if os.path.exists(old_buffer_file):
+                    with open(old_buffer_file, 'rb') as old_f:
+                        data = old_f.read()
+                    with open(new_buffer_file, 'wb') as new_f:
+                        new_f.write(data)
+                    # Remove old file
+                    os.remove(old_buffer_file)
+                    self.logger.info(f"Moved buffer file: {old_buffer_file} -> {new_buffer_file}")
+                else:
+                    # Create new file
+                    with open(new_buffer_file, 'wb') as f:
+                        f.write(bytes(self.output_buffer))
+                    self.logger.info(f"Created new buffer file: {new_buffer_file}")
+
+                # Update buffer file path
+                self.buffer_file = new_buffer_file
+                self.logger.info(f"Buffer file path updated to use Claude session ID: {claude_session_id[:8]}")
+
+            except Exception as e:
+                self.logger.error(f"Failed to update buffer file path: {e}")
 
     def cleanup(self):
         """Clean up resources"""
@@ -772,12 +910,34 @@ class HybridPTYWrapper:
             except Exception as e:
                 self.logger.error(f"Error removing socket file: {e}")
 
+        # Remove buffer file
+        if os.path.exists(self.buffer_file):
+            try:
+                os.remove(self.buffer_file)
+                self.logger.debug(f"Buffer file removed: {self.buffer_file}")
+            except Exception as e:
+                self.logger.error(f"Error removing buffer file: {e}")
+
         self.logger.info("Cleanup completed")
 
     def run(self):
         """Main wrapper logic - spawn Claude in PTY and handle I/O"""
         self.logger.info("Starting main run loop")
         start_time = time.time()
+
+        # VIBETUNNEL OPTIMIZATION: Use no-PTY mode to avoid nested PTY artifacts
+        if self.is_vibetunnel():
+            self.logger.info("VibeTunnel detected - using no-PTY mode")
+            print(f"{YELLOW}[VibeTunnel] Detected - switching to no-PTY mode{RESET}", file=sys.stderr)
+            try:
+                from claude_wrapper_vibetunnel import run_vibetunnel_mode
+                self.logger.info("VibeTunnel module imported successfully")
+                return run_vibetunnel_mode(self)
+            except Exception as e:
+                self.logger.error(f"Failed to import VibeTunnel module: {e}", exc_info=True)
+                print(f"{RED}[VibeTunnel] Failed to load no-PTY mode: {e}{RESET}", file=sys.stderr)
+                print(f"{YELLOW}[VibeTunnel] Falling back to standard PTY mode{RESET}", file=sys.stderr)
+                # Fall through to standard mode
 
         # Setup socket directory
         self.setup_socket_directory()
@@ -796,9 +956,6 @@ class HybridPTYWrapper:
         self.socket_thread = threading.Thread(target=self.socket_listener, daemon=True)
         self.socket_thread.start()
         self.logger.debug("Socket listener thread started")
-
-        # Print startup banner
-        self.print_startup_banner()
 
         # Find Claude Code binary using config
         claude_bin = get_claude_bin()
@@ -828,6 +985,9 @@ class HybridPTYWrapper:
         # Enter alternate screen buffer (like vim/less) for visual isolation
         if has_terminal:
             self.enter_alternate_screen()
+
+        # Print startup banner (after entering alternate screen so it's visible)
+        self.print_startup_banner()
 
         try:
             # Spawn Claude Code in a pseudo-terminal (pty)
@@ -898,11 +1058,18 @@ class HybridPTYWrapper:
 
                 # Only do I/O loop if we have a terminal
                 if has_terminal:
-                    # Set terminal to raw mode for proper character handling
-                    # Disable echo to prevent duplication
+                    # Set up signal handler for window size changes (SIGWINCH)
+                    signal.signal(signal.SIGWINCH, self.handle_window_size_change)
+                    self.logger.info("SIGWINCH handler registered for dynamic window resizing")
+
+                    # Synchronize initial PTY size with terminal
+                    self.sync_window_size()
+
+                    # Set terminal to raw mode
+                    self.logger.info("Setting terminal to raw mode")
                     tty.setraw(sys.stdin.fileno())
                     attrs = termios.tcgetattr(sys.stdin)
-                    attrs[3] = attrs[3] & ~termios.ECHO  # Explicitly disable echo
+                    attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
                     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
 
                     try:
@@ -923,6 +1090,8 @@ class HybridPTYWrapper:
                                 # Claude output - pass through to terminal unchanged
                                 data = os.read(self.master_fd, 1024)
                                 if data:
+                                    # Add to output buffer for permission prompt capture
+                                    self.add_to_output_buffer(data)
                                     # Write to terminal (hooks will capture this)
                                     os.write(sys.stdout.fileno(), data)
                                 else:
@@ -943,6 +1112,8 @@ class HybridPTYWrapper:
                                 # Claude output - pass through to stdout (hooks will capture this)
                                 data = os.read(self.master_fd, 1024)
                                 if data:
+                                    # Add to output buffer for permission prompt capture
+                                    self.add_to_output_buffer(data)
                                     os.write(sys.stdout.fileno(), data)
                                 else:
                                     # Claude exited
