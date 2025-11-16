@@ -1,15 +1,18 @@
 """
-VibeTunnel-specific wrapper that avoids nested PTY.
+VibeTunnel-specific wrapper using PTY Master Write for input injection.
 
-Instead of creating a PTY (which VibeTunnel already has), this:
-1. Runs Claude directly (it inherits VibeTunnel's stdin/stdout/stderr)
-2. Socket listener writes Slack input to VibeTunnel's terminal
-3. Claude reads from the same terminal and sees the injected input
+Creates a minimal PTY for reliable Slack input injection:
+1. Uses pty.fork() to create master/slave PTY pair
+2. Claude runs in child, connected to PTY slave (stdin/stdout/stderr)
+3. Parent writes Slack input to PTY master → flows to child's stdin
+4. Parent reads Claude output from PTY master → forwards to real stdout
 
 Architecture:
-    VibeTunnel PTY (only PTY) ← Claude reads from here
-        ↑
-        └→ Slack input written here
+    VibeTunnel PTY (outer)
+        └→ Wrapper PTY (inner) ← Minimal, just for I/O control
+            ├→ master_fd (parent writes/reads here)
+            └→ slave (child's stdin/stdout/stderr)
+                └→ Claude process
 """
 
 import subprocess
@@ -19,16 +22,17 @@ import signal
 
 def run_vibetunnel_mode(wrapper):
     """
-    Run Claude in VibeTunnel without creating nested PTY.
+    Run Claude in VibeTunnel using PTY Master Write for input injection.
 
-    Simple approach: Just exec Claude directly.
-    Let VibeTunnel handle all terminal I/O.
-    Socket listener will write to terminal which Claude reads.
+    Creates a minimal PTY to enable reliable Slack input injection:
+    - Parent writes to master_fd → child reads as stdin
+    - Parent reads from master_fd ← child writes to stdout/stderr
+    - Proven approach used by pexpect, tmux, screen, etc.
 
     Args:
         wrapper: HybridPTYWrapper instance (for socket, registry, etc)
     """
-    wrapper.logger.info("=== VibeTunnel Mode: Direct execution (no nested PTY) ===")
+    wrapper.logger.info("=== VibeTunnel Mode: PTY Master Write ===")
 
     # Setup (but don't create PTY)
     wrapper.setup_socket_directory()
@@ -73,23 +77,30 @@ def run_vibetunnel_mode(wrapper):
     print(f"{CYAN}Session ID: {BOLD}{wrapper.session_id}{RESET}", file=sys.stderr)
     print(f"{CYAN}Project: {wrapper.project_dir}{RESET}", file=sys.stderr)
     print(f"{CYAN}Input Socket: {wrapper.socket_path}{RESET}", file=sys.stderr)
-    print(f"{YELLOW}VibeTunnel: No-PTY Mode (direct execution){RESET}", file=sys.stderr)
-    print(f"{GREEN}Hooks will handle output streaming to Slack{RESET}", file=sys.stderr)
+    print(f"{YELLOW}VibeTunnel: PTY Master Write Mode{RESET}", file=sys.stderr)
+    print(f"{GREEN}Slack input via PTY master → Claude stdin{RESET}", file=sys.stderr)
     print(f"{BOLD}{CYAN}{separator}{RESET}\n", file=sys.stderr)
 
-    # Fork and exec Claude
-    # Child: exec Claude (inherits VibeTunnel's stdin/stdout/stderr)
-    # Parent: Monitor Slack queue and inject input to terminal
-    pid = os.fork()
+    # Fork with PTY to enable input injection
+    # Child: exec Claude (stdin/stdout/stderr connected to PTY slave)
+    # Parent: Write to master_fd for input, read from master_fd for output
+    import pty
+
+    pid, master_fd = pty.fork()
 
     if pid == 0:
         # Child: Change to project dir and exec Claude
+        # stdin/stdout/stderr automatically connected to PTY slave by pty.fork()
         os.chdir(wrapper.project_dir)
         os.execvp(claude_bin, claude_cmd)
         # Never reaches here
     else:
         # Parent: Monitor Slack input queue
         wrapper.logger.info(f"Claude forked - PID: {pid}")
+
+        # Don't set raw mode - use default PTY mode (canonical/cooked)
+        # Raw mode causes artifacts in VibeTunnel
+        # Default mode works fine for input injection via master_fd
 
         # Wait for thread_ts (needed for Slack communication)
         wrapper.logger.info("Waiting for Slack thread creation...")
@@ -123,8 +134,9 @@ def run_vibetunnel_mode(wrapper):
         if wrapper.thread_ts and hasattr(wrapper, 'claude_session_uuid'):
             wrapper.register_claude_session(wrapper.claude_session_uuid)
 
-        # Monitor for Slack input and write to terminal
-        wrapper.logger.info("Monitoring Slack input queue...")
+        # Monitor for both Claude output and Slack input
+        wrapper.logger.info("Monitoring PTY master for I/O...")
+        import select
         try:
             while True:
                 # Check if Claude is still running
@@ -134,16 +146,35 @@ def run_vibetunnel_mode(wrapper):
                     wrapper.logger.info("Claude process ended")
                     break
 
-                # Check Slack queue
+                # Use select to check if master_fd has output ready
+                # Timeout 0.1s so we can check Slack queue frequently
+                readable, _, _ = select.select([master_fd], [], [], 0.1)
+
+                # Forward Claude's output to real stdout
+                if master_fd in readable:
+                    try:
+                        output = os.read(master_fd, 4096)
+                        if output:
+                            # Write to real stdout so VibeTunnel sees it
+                            os.write(sys.stdout.fileno(), output)
+                        else:
+                            # EOF - Claude closed its output
+                            wrapper.logger.info("Claude closed PTY")
+                            break
+                    except OSError as e:
+                        wrapper.logger.error(f"Error reading from PTY: {e}")
+                        break
+
+                # Check Slack queue for input to inject
                 try:
-                    slack_data = wrapper.slack_input_queue.get(timeout=0.5)
-                    # Write to terminal - Claude will read it
-                    # Use ioctl to inject into terminal input buffer
-                    import fcntl
-                    import termios as term
-                    for byte in slack_data:
-                        fcntl.ioctl(sys.stdin, term.TIOCSTI, bytes([byte]))
-                    wrapper.logger.info(f"Injected {len(slack_data)} bytes to terminal")
+                    slack_data = wrapper.slack_input_queue.get(timeout=0.1)
+                    # Write to PTY master - flows to Claude's stdin
+                    # Match standard mode pattern: write text, sleep, write CR
+                    bytes_written = os.write(master_fd, slack_data)
+                    wrapper.logger.debug(f"Wrote {bytes_written} bytes to PTY master")
+                    time.sleep(0.1)  # Give PTY time to process
+                    os.write(master_fd, b'\r')
+                    wrapper.logger.info(f"Input injected with Enter key ({bytes_written} bytes + CR)")
                 except queue.Empty:
                     pass
 

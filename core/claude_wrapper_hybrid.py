@@ -715,10 +715,10 @@ class HybridPTYWrapper:
                         # Inject into Claude's stdin
                         # VibeTunnel mode: use queue (no PTY)
                         if hasattr(self, 'slack_input_queue'):
-                            # VibeTunnel mode - add to queue with newline appended
-                            # IMPORTANT: Put as single item so TIOCSTI injection gets both text + newline
-                            self.slack_input_queue.put(data.encode('utf-8') + b'\n')
-                            self.logger.info("Input queued for VibeTunnel mode with newline")
+                            # VibeTunnel mode - queue just the text (CR added separately in I/O loop)
+                            # Matches standard mode pattern: write text, sleep, write CR
+                            self.slack_input_queue.put(data.encode('utf-8'))
+                            self.logger.info("Input queued for VibeTunnel mode")
                         else:
                             # Standard mode - write to PTY
                             bytes_written = os.write(self.master_fd, data.encode('utf-8'))
