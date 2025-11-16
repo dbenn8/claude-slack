@@ -399,7 +399,7 @@ class RegistryClient:
 class HybridPTYWrapper:
     """Hybrid PTY wrapper combining input control with hooks output"""
 
-    def __init__(self, session_id, project_dir, claude_args=None, vt_mode=None):
+    def __init__(self, session_id, project_dir, claude_args=None):
         self.session_id = session_id
         self.project_dir = project_dir
         self.claude_args = claude_args or []
@@ -414,27 +414,9 @@ class HybridPTYWrapper:
         self.logger.info(f"Python version: {sys.version}")
         self.logger.info(f"Working directory: {os.getcwd()}")
 
-        # VibeTunnel terminal mode setting (for testing different approaches)
-        # Mode 0: Treat VibeTunnel like standard terminal (ignore VibeTunnel)
-        # Mode 1: Raw mode with CR/NL mapping (default)
-        # Mode 4: Pass-through mode (recommended - let xterm.js handle output)
-        self.mode_file = f"/tmp/vibetunnel_mode_{session_id}.txt"
-        # Priority: CLI arg > environment variable > default (1)
-        if vt_mode is not None:
-            self.vibetunnel_mode = vt_mode
-            self.logger.info(f"VibeTunnel mode set via --vt-mode: {vt_mode}")
-        else:
-            self.vibetunnel_mode = int(os.environ.get('VIBETUNNEL_MODE', '1'))
-        # Write initial mode to file
-        try:
-            with open(self.mode_file, 'w') as f:
-                f.write(str(self.vibetunnel_mode))
-        except Exception as e:
-            self.logger.error(f"Failed to write mode file: {e}")
-
-        self.mode_switch_requested = False  # Flag for signal handler
+        # VibeTunnel detection
         if self.is_vibetunnel():
-            self.logger.info(f"VibeTunnel detected - using mode {self.vibetunnel_mode}")
+            self.logger.info("VibeTunnel detected - will use no-PTY mode")
 
         self.logger.info("="*60)
 
@@ -758,26 +740,6 @@ class HybridPTYWrapper:
         """Check if running in VibeTunnel environment"""
         return 'VIBETUNNEL_SESSION_ID' in os.environ
 
-    def handle_mode_switch(self, signum, frame):
-        """Signal handler to switch VibeTunnel modes during session"""
-        # Read mode from file (instead of environment variable)
-        try:
-            if os.path.exists(self.mode_file):
-                with open(self.mode_file, 'r') as f:
-                    new_mode = int(f.read().strip())
-                if new_mode != self.vibetunnel_mode:
-                    self.logger.info(f"Mode switch signal received: {self.vibetunnel_mode} -> {new_mode}")
-                    old_mode = self.vibetunnel_mode
-                    self.vibetunnel_mode = new_mode
-                    self.mode_switch_requested = True
-                    print(f"\n{YELLOW}[Mode Switch] {old_mode} -> {new_mode}{RESET}", file=sys.stderr)
-                else:
-                    self.logger.info(f"Mode switch signal received but mode unchanged: {new_mode}")
-            else:
-                self.logger.warning(f"Mode file not found: {self.mode_file}")
-        except Exception as e:
-            self.logger.error(f"Error reading mode file: {e}")
-
     def handle_window_size_change(self, signum, frame):
         """Signal handler for terminal window size changes (SIGWINCH)"""
         if self.master_fd is None:
@@ -812,96 +774,6 @@ class HybridPTYWrapper:
         except Exception as e:
             self.logger.error(f"Error setting initial PTY size: {e}")
 
-    def apply_terminal_mode(self, force=False):
-        """Apply appropriate terminal mode based on environment"""
-        if not self.is_vibetunnel() and not force:
-            # Standard terminal: Use raw mode
-            self.logger.info("Standard terminal - using raw mode")
-            tty.setraw(sys.stdin.fileno())
-            attrs = termios.tcgetattr(sys.stdin)
-            attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-            return
-
-        # VibeTunnel: Use mode based on VIBETUNNEL_MODE env var
-        mode = self.vibetunnel_mode
-        self.logger.info(f"VibeTunnel Mode {mode} selected")
-
-        if mode == 0:
-            # Mode 0: Treat VibeTunnel like standard terminal (ignore VibeTunnel completely)
-            self.logger.info("Mode 0: Using standard raw mode (ignoring VibeTunnel)")
-            tty.setraw(sys.stdin.fileno())
-            attrs = termios.tcgetattr(sys.stdin)
-            attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-
-        elif mode == 1:
-            # Option 1: Raw mode with VibeTunnel-specific flags (CR/NL mapping)
-            self.logger.info("Mode 1: Raw mode with CR/NL mapping for web terminal")
-            tty.setraw(sys.stdin.fileno())
-            attrs = termios.tcgetattr(sys.stdin)
-            attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
-            # VibeTunnel-specific: Enable CR-NL mapping for web terminal
-            attrs[1] = attrs[1] | termios.ONLCR  # Map NL to CR-NL on output
-            attrs[0] = attrs[0] | termios.ICRNL  # Map CR to NL on input
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-
-        elif mode == 2:
-            # Option 2: Canonical mode with minimal processing
-            self.logger.info("Mode 2: Canonical mode with minimal processing")
-            attrs = termios.tcgetattr(sys.stdin)
-            # Use canonical mode (line buffering)
-            attrs[3] = attrs[3] | termios.ICANON
-            # Disable echo and most processing
-            attrs[3] = attrs[3] & ~termios.ECHO
-            attrs[3] = attrs[3] & ~termios.ECHONL
-            # Disable special character processing
-            attrs[3] = attrs[3] & ~termios.ISIG
-            attrs[3] = attrs[3] & ~termios.IEXTEN
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-
-        elif mode == 3:
-            # Option 3: No terminal mode changes (default state only)
-            self.logger.info("Mode 3: Default terminal settings, echo disabled only")
-            attrs = termios.tcgetattr(sys.stdin)
-            attrs[3] = attrs[3] & ~termios.ECHO
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-
-        elif mode == 4:
-            # SOLUTION 2: VibeTunnel pass-through mode
-            # Minimal intervention - let VibeTunnel's xterm.js handle output natively
-            # This mode addresses the root cause: nested PTY interference
-            self.logger.info("Mode 4: VibeTunnel pass-through mode (minimal intervention)")
-            
-            # Set raw mode for input (so Claude gets keystrokes immediately)
-            tty.setraw(sys.stdin.fileno())
-            attrs = termios.tcgetattr(sys.stdin)
-            
-            # Disable echo (don't show typed characters twice)
-            attrs[3] = attrs[3] & ~termios.ECHO
-            
-            # CRITICAL: Remove any CR/NL mapping that could interfere
-            # Let VibeTunnel's xterm.js handle all output processing
-            attrs[1] = attrs[1] & ~termios.ONLCR  # NO NL to CR-NL mapping on output
-            attrs[0] = attrs[0] & ~termios.ICRNL  # NO CR to NL mapping on input
-            attrs[0] = attrs[0] & ~termios.INLCR  # NO NL to CR mapping on input
-            
-            # Apply settings
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-            self.logger.info("VibeTunnel pass-through mode configured - raw input, no output mapping")
-
-        else:
-            self.logger.warning(f"Unknown VibeTunnel mode {mode}, using mode 4 (pass-through)")
-            # Fall back to mode 4 (pass-through) instead of mode 1
-            tty.setraw(sys.stdin.fileno())
-            attrs = termios.tcgetattr(sys.stdin)
-            attrs[3] = attrs[3] & ~termios.ECHO
-            # Ensure NO mapping
-            attrs[1] = attrs[1] & ~termios.ONLCR
-            attrs[0] = attrs[0] & ~termios.ICRNL
-            attrs[0] = attrs[0] & ~termios.INLCR
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
-
     def print_startup_banner(self):
         """Print startup banner with session information"""
         separator = "─" * 50
@@ -912,13 +784,7 @@ class HybridPTYWrapper:
         print(f"{CYAN}Project: {self.project_dir}{RESET}", file=sys.stderr)
         print(f"{CYAN}Input Socket: {self.socket_path}{RESET}", file=sys.stderr)
         if self.is_vibetunnel():
-            mode_desc = {
-                1: "Raw + CR/NL mapping",
-                2: "Canonical mode",
-                3: "Default state",
-                4: "Pass-through (recommended)"
-            }.get(self.vibetunnel_mode, "Unknown")
-            print(f"{YELLOW}VibeTunnel Mode {self.vibetunnel_mode}: {mode_desc}{RESET}", file=sys.stderr)
+            print(f"{YELLOW}VibeTunnel: Using No-PTY mode{RESET}", file=sys.stderr)
         print(f"{GREEN}Hooks will handle output streaming to Slack{RESET}", file=sys.stderr)
         print(f"{BOLD}{CYAN}{separator}{RESET}\n", file=sys.stderr)
 
@@ -1192,11 +1058,6 @@ class HybridPTYWrapper:
 
                 # Only do I/O loop if we have a terminal
                 if has_terminal:
-                    # Set up signal handler for mode switching (SIGUSR1)
-                    if self.is_vibetunnel():
-                        signal.signal(signal.SIGUSR1, self.handle_mode_switch)
-                        self.logger.info("Signal handler registered: kill -SIGUSR1 to switch modes")
-
                     # Set up signal handler for window size changes (SIGWINCH)
                     signal.signal(signal.SIGWINCH, self.handle_window_size_change)
                     self.logger.info("SIGWINCH handler registered for dynamic window resizing")
@@ -1204,17 +1065,16 @@ class HybridPTYWrapper:
                     # Synchronize initial PTY size with terminal
                     self.sync_window_size()
 
-                    # Apply appropriate terminal mode
-                    self.apply_terminal_mode()
+                    # Set terminal to raw mode
+                    self.logger.info("Setting terminal to raw mode")
+                    tty.setraw(sys.stdin.fileno())
+                    attrs = termios.tcgetattr(sys.stdin)
+                    attrs[3] = attrs[3] & ~termios.ECHO  # Disable echo
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
 
                     try:
                         # Main I/O loop - simple pass-through
                         while True:
-                            # Check if mode switch was requested
-                            if self.mode_switch_requested:
-                                self.apply_terminal_mode(force=True)
-                                self.mode_switch_requested = False
-                                self.logger.info(f"Terminal mode switched to {self.vibetunnel_mode}")
                             # Wait for input from either user terminal or Claude's output
                             r, w, e = select.select([sys.stdin, self.master_fd], [], [], 1.0)
 
@@ -1288,8 +1148,6 @@ def main():
     )
 
     parser.add_argument("--session-id", help="Unique session ID (auto-generated if not provided)")
-    parser.add_argument("--vt-mode", type=int, choices=[0, 1, 4], 
-                        help="VibeTunnel mode (0=standard, 1=CR/NL mapping, 4=pass-through)")
     parser.add_argument("--help", "-h", action="store_true", help="Show help message")
 
     # Parse known args, remaining go to Claude
@@ -1310,8 +1168,7 @@ def main():
     wrapper = HybridPTYWrapper(
         session_id=session_id,
         project_dir=project_dir,
-        claude_args=claude_args,
-        vt_mode=args.vt_mode
+        claude_args=claude_args
     )
 
     # Run wrapper
