@@ -1,0 +1,30 @@
+# Environment
+.env
+*.pyc
+__pycache__/
+*.log
+
+# Slack data
+/logs/
+slack_detailed.log
+slack_listener.log
+
+# Session registry
+*.db
+*.db-journal
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*.backup
+*.bak

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""
+Claude-Slack: Bidirectional Slack Integration for Claude Code
+
+Run Claude Code with seamless Slack integration:
+- Send messages from Slack → injected into Claude
+- Claude's responses → posted to Slack thread
+- Full terminal UI preserved with alternate screen buffer
+- Each session gets its own dedicated Slack thread
+
+Usage:
+    ./claude-slack                    # Start in current directory
+    ./claude-slack --help             # Show Claude Code help
+
+Features:
+- Bidirectional communication (Slack ↔ Claude)
+- Multi-session support (multiple Claude instances)
+- Visual isolation (alternate screen buffer like vim/less)
+- Session persistence tracking
+- Real-time message routing
+
+Architecture:
+    Slack → Session Registry → Unix Socket → PTY Wrapper → Claude Code
+                                                  ↓
+                                            Alternate Screen
+                                                  ↓
+                                         Hooks Capture Output
+                                                  ↓
+                                            Slack Thread
+
+Perfect for:
+- Remote pair programming
+- Team collaboration
+- Async code reviews
+- Sharing Claude sessions
+
+Open source: https://github.com/yourusername/claude-slack
+"""
+
+import sys
+import os
+
+# Add slack_bot to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, script_dir)
+
+# Import and run the wrapper
+from slack_bot.claude_wrapper_hybrid import main
+
+if __name__ == "__main__":
+    main()
