@@ -159,9 +159,10 @@ After adding `~/.claude/claude-slack/bin` to your PATH:
 **Root Cause**: Socket communication starvation - the connection between Slack listener and Claude session becomes unresponsive
 
 **Workaround**:
-- Send an @ mention to your bot (e.g., `@claudebot your message here`)
+- Send an @ mention to your bot.  Make the @ mention the FIRST word in your message (e.g., `@claudebot your message here`)
 - The @ mention "wakes up" the listener and re-establishes communication
 - After the @ mention, regular messages should work again
+- Occasionally, its flakey enough that you need to copy paste your message and send it again to wake it up.
 
 **Long-term solution**: Under investigation
 
