@@ -8,6 +8,13 @@ Extracts the notification message from hook input and posts it to Slack.
 This hook ensures that important prompts like numbered choices (1, 2, 3) and permission
 requests are sent to Slack so users can respond even when not at their terminal.
 
+UPDATED 2025/11/17: Permission text mapping based on 14 REAL captured permission prompts.
+Key findings:
+- Option 2 text varies by context (directory access, file operations, edits)
+- Some operations only get 2 options (background processes, /tmp operations)
+- Some operations cause errors even after approval (Write with ../../, sleep &)
+- No "sticky" permissions - same operation may prompt multiple times
+
 Hook Input (stdin):
     {
         "session_id": "abc12345",
@@ -467,51 +474,74 @@ def retry_parse_transcript(transcript_path, max_wait=2.5, check_interval=0.1):
 
 
 # Exact Claude Code permission text mapping
-# Based on reverse-engineering Claude's permission system
-# Format: (permission_mode, tool_name, is_dangerous) -> list of exact option strings
+# Updated 2025/11/17 based on 14 REAL captured permission prompts
+# Format: (context_type, tool_name, option_count) -> list of exact option strings
 CLAUDE_PERMISSION_TEXT = {
-    # Default mode - 3 options for safe commands
-    ("default", "Bash", False): [
-        "Approve this time",
-        "Approve commands like this for this project",
-        "Deny, tell Claude what to do instead"
-    ],
-    ("default", "Write", False): [
-        "Approve this time",
-        "Approve commands like this for this project",
-        "Deny, tell Claude what to do instead"
-    ],
-    ("default", "Edit", False): [
-        "Approve this time",
-        "Approve commands like this for this project",
-        "Deny, tell Claude what to do instead"
-    ],
-    ("default", "Read", False): [
-        "Approve this time",
-        "Approve commands like this for this project",
-        "Deny, tell Claude what to do instead"
+    # Bash - Directory access (out of scope) - 3 options
+    ("bash_directory_access", "Bash", 3): [
+        "Yes",
+        "Yes, allow reading from {directory}/ from this project",
+        "No, and tell Claude what to do differently (esc)"
     ],
 
-    # Default mode - 2 options for dangerous commands
-    ("default", "Bash", True): [
-        "Approve",
-        "Deny"
+    # Bash - File commands - 3 options
+    ("bash_file_commands", "Bash", 3): [
+        "Yes",
+        "Yes, and don't ask again for {file} commands in {location}",
+        "No, and tell Claude what to do differently (esc)"
     ],
 
-    # Accept edits mode - always 2 options
-    ("acceptEdits", None, None): [
-        "Approve",
-        "Deny"
+    # Bash - Sudo commands - 3 options (usually denied by user)
+    ("bash_sudo", "Bash", 3): [
+        "Yes",
+        "Yes, and don't ask again for sudo {command} commands in {location}",
+        "No, and tell Claude what to do differently (esc)"
     ],
 
-    # Plan mode - usually 2 options
-    ("plan", None, None): [
-        "Approve",
-        "Deny"
+    # Bash - Background process or /tmp operations - ONLY 2 options
+    ("bash_background_or_tmp", "Bash", 2): [
+        "Yes",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
+    # Write tool - Create file (cross-project) - 3 options
+    ("write_create", "Write", 3): [
+        "Yes",
+        "Yes, allow all edits in {directory}/ during this session",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
+    # Edit tool - Modify file (cross-project) - 3 options
+    ("edit_modify", "Edit", 3): [
+        "Yes",
+        "Yes, allow all edits in {directory}/ during this session",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
+    # Read operations - Based on original analysis
+    ("read_file", "Read", 3): [
+        "Yes",
+        "Yes, allow reading from {directory}/ from this project",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
+    # Fallback for unmatched contexts - 3 options
+    ("default", None, 3): [
+        "Yes",
+        "Yes, and don't ask again for this operation",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
+    # Fallback for 2-option scenarios
+    ("default_2_option", None, 2): [
+        "Yes",
+        "No, and tell Claude what to do differently (esc)"
     ],
 }
 
-# Dangerous command patterns (2 options instead of 3)
+# Dangerous command patterns
+# NOTE: Based on testing, rm -rf in command chains still gets 3 options!
+# The option 2 text focuses on other operations in the chain
 DANGEROUS_PATTERNS = [
     r'rm\s+-rf',
     r'sudo',
@@ -523,35 +553,87 @@ DANGEROUS_PATTERNS = [
     r'wget.*\|.*sh',
 ]
 
+# ERROR PATTERNS - Operations that cause errors AFTER permission approval
+# Based on 14 real permission prompt tests:
+# 1. Write tool with relative path (../../) → AbortError + Error
+# 2. Background processes (command &) → Error
+# 3. Complex /tmp operations with heredoc → Error
+# These errors occur even when user approves (chooses option 1)
 
-def is_dangerous_command(tool_name, tool_input):
+
+def determine_permission_context(tool_name, tool_input):
     """
-    Detect if a command is dangerous (gets 2 options instead of 3).
+    Determine the permission context based on tool and input.
+    Based on analysis of 14 real permission prompts.
 
     Args:
         tool_name: Name of the tool being used
         tool_input: Tool input parameters
 
     Returns:
-        True if dangerous, False otherwise
+        Tuple of (context_type, expected_option_count)
     """
-    if tool_name != "Bash":
-        return False
-
-    command = tool_input.get('command', '')
-
     import re
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, command):
-            debug_log(f"Detected dangerous command pattern: {pattern}", "PERMISSION")
-            return True
 
-    return False
+    if tool_name == "Bash":
+        command = tool_input.get('command', '')
+
+        # Check for background process (& at end)
+        if re.search(r'&\s*$', command):
+            debug_log(f"Detected background process: {command[:50]}", "PERMISSION")
+            return ("bash_background_or_tmp", 2)
+
+        # Check for /tmp operations (often get 2 options)
+        if re.search(r'(touch|rm|cat.*>)\s+/tmp/', command):
+            debug_log(f"Detected /tmp operation: {command[:50]}", "PERMISSION")
+            return ("bash_background_or_tmp", 2)
+
+        # Check for sudo commands
+        if re.search(r'\bsudo\b', command):
+            debug_log(f"Detected sudo command: {command[:50]}", "PERMISSION")
+            return ("bash_sudo", 3)
+
+        # Check for directory listing/access (ls, cd to out-of-scope)
+        if re.search(r'\bls\b.*/(Desktop|Downloads|Documents|codeOLD)', command):
+            debug_log(f"Detected out-of-scope directory access: {command[:50]}", "PERMISSION")
+            return ("bash_directory_access", 3)
+
+        # Check for file operations (echo >, touch, rm, etc.)
+        if re.search(r'(echo.*>|touch|rm\s+(?!-rf))', command):
+            debug_log(f"Detected file command: {command[:50]}", "PERMISSION")
+            return ("bash_file_commands", 3)
+
+        # Check for dangerous patterns (rm -rf, etc.)
+        for pattern in DANGEROUS_PATTERNS:
+            if re.search(pattern, command):
+                debug_log(f"Detected dangerous pattern {pattern}: {command[:50]}", "PERMISSION")
+                # Note: rm -rf in chains still gets 3 options based on our testing
+                return ("bash_file_commands", 3)
+
+        # Default Bash context
+        return ("bash_file_commands", 3)
+
+    elif tool_name == "Write":
+        # Write tool for file creation
+        return ("write_create", 3)
+
+    elif tool_name == "Edit":
+        # Edit tool for file modification
+        return ("edit_modify", 3)
+
+    elif tool_name == "Read":
+        # Read tool for file reading
+        return ("read_file", 3)
+
+    else:
+        # Unknown tool - use default
+        return ("default", 3)
 
 
 def get_exact_permission_options(tool_name, tool_input, permission_mode="default"):
     """
     Get exact Claude permission options based on context.
+    Updated based on 14 real captured permission prompts.
 
     Args:
         tool_name: Name of tool requiring permission
@@ -561,34 +643,38 @@ def get_exact_permission_options(tool_name, tool_input, permission_mode="default
     Returns:
         List of exact permission option strings, or None if not found
     """
-    # Check if dangerous command
-    is_dangerous = is_dangerous_command(tool_name, tool_input)
+    # Determine context and expected option count
+    context_type, expected_options = determine_permission_context(tool_name, tool_input)
 
-    # Try exact match first
-    key = (permission_mode, tool_name, is_dangerous)
+    # Try to find exact match with context
+    key = (context_type, tool_name, expected_options)
     if key in CLAUDE_PERMISSION_TEXT:
         options = CLAUDE_PERMISSION_TEXT[key]
-        debug_log(f"Found EXACT match: mode={permission_mode}, tool={tool_name}, dangerous={is_dangerous}", "PERMISSION")
+        debug_log(f"Found CONTEXT match: context={context_type}, tool={tool_name}, options={expected_options}", "PERMISSION")
         return options
 
-    # Try wildcard match (any tool in this permission mode)
-    key = (permission_mode, None, None)
+    # Try fallback for option count
+    if expected_options == 2:
+        key = ("default_2_option", None, 2)
+    else:
+        key = ("default", None, 3)
+
     if key in CLAUDE_PERMISSION_TEXT:
         options = CLAUDE_PERMISSION_TEXT[key]
-        debug_log(f"Found WILDCARD match: mode={permission_mode}", "PERMISSION")
+        debug_log(f"Using FALLBACK for {expected_options} options", "PERMISSION")
         return options
 
-    # Default fallback
-    if is_dangerous:
-        options = ["Approve", "Deny"]
+    # Ultimate fallback (shouldn't reach here with updated mappings)
+    if expected_options == 2:
+        options = ["Yes", "No, and tell Claude what to do differently (esc)"]
     else:
         options = [
-            "Approve this time",
-            "Approve commands like this for this project",
-            "Deny, tell Claude what to do instead"
+            "Yes",
+            "Yes, and don't ask again for this operation",
+            "No, and tell Claude what to do differently (esc)"
         ]
 
-    debug_log(f"Using FALLBACK options: dangerous={is_dangerous}", "PERMISSION")
+    debug_log(f"Using ULTIMATE FALLBACK: {expected_options} options", "PERMISSION")
     return options
 
 
@@ -653,23 +739,37 @@ def enhance_notification_message(
 
             if os.path.exists(buffer_file):
                 try:
-                    # NO DELAY - read buffer immediately
-                    # Testing shows delays cause buffer to be cleared by UI updates
-                    # import time
-                    # time.sleep(0.075)  # REMOVED: Delay causes buffer to be empty
-                    debug_log("Reading buffer immediately (no delay)", "ENHANCE")
+                    # RETRY LOOP: Buffer might not be ready yet, check multiple times
+                    # 10 attempts × 0.2s = 2 seconds max wait (unnoticeable to user)
+                    import time
+                    max_retries = 10
+                    retry_delay = 0.2  # 200ms between retries
 
-                    with open(buffer_file, 'rb') as f:
-                        buffer_content = f.read()
+                    for attempt in range(max_retries):
+                        debug_log(f"Buffer read attempt {attempt + 1}/{max_retries}", "ENHANCE")
 
-                    if buffer_content:
-                        debug_log(f"Read output buffer ({len(buffer_content)} bytes)", "ENHANCE")
-                        exact_options_from_buffer = parse_permission_prompt_from_output(buffer_content, session_id)
+                        with open(buffer_file, 'rb') as f:
+                            buffer_content = f.read()
 
-                        if exact_options_from_buffer:
-                            debug_log(f"SUCCESS: Got exact options from buffer: {exact_options_from_buffer}", "ENHANCE")
+                        if buffer_content:
+                            debug_log(f"Read output buffer ({len(buffer_content)} bytes)", "ENHANCE")
+                            exact_options_from_buffer = parse_permission_prompt_from_output(buffer_content, session_id)
+
+                            if exact_options_from_buffer:
+                                debug_log(f"SUCCESS: Got exact options from buffer on attempt {attempt + 1}: {exact_options_from_buffer}", "ENHANCE")
+                                break  # Success! Exit retry loop
+                            else:
+                                debug_log(f"Buffer parsing failed on attempt {attempt + 1}, retrying...", "ENHANCE")
                         else:
-                            debug_log("Buffer parsing failed, will use transcript fallback", "ENHANCE")
+                            debug_log(f"Buffer empty on attempt {attempt + 1}, retrying...", "ENHANCE")
+
+                        # Wait before next retry (unless this was the last attempt)
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+
+                    if not exact_options_from_buffer:
+                        debug_log("All buffer read attempts failed, falling back to hardcoded mapping", "ENHANCE")
+
                 except Exception as e:
                     debug_log(f"Error reading buffer: {e}", "ENHANCE")
 

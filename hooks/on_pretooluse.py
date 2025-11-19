@@ -2,6 +2,12 @@
 """
 Claude Code PreToolUse Hook - Capture AskUserQuestion calls to Slack
 
+Version: 1.1.0
+
+Changelog:
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
+
 Triggered before Claude executes any tool, allowing us to capture AskUserQuestion
 calls with their full question text and options, which are not available in the
 Notification hook.
@@ -50,6 +56,9 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
+
+# Hook version for auto-update detection
+HOOK_VERSION = "1.1.0"
 
 # Debug log file path
 DEBUG_LOG = "/tmp/pretooluse_hook_debug.log"
@@ -274,6 +283,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         chunks = chunks[:5]
 
     # Post each chunk
+    failed_chunks = []
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -291,11 +301,17 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
         except SlackApiError as e:
-            log_error(f"Slack API error: {e.response['error']}")
-            return False
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
         except Exception as e:
-            log_error(f"Error posting to Slack: {e}")
-            return False
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
 
     return True
 

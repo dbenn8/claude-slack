@@ -96,8 +96,9 @@ HOOKS_TO_INSTALL=(
     "on_pretooluse.py"
 )
 
-# Check and install each hook
+# Check and install/update each hook
 HOOKS_INSTALLED=0
+HOOKS_UPDATED=0
 for hook in "${HOOKS_TO_INSTALL[@]}"; do
     TEMPLATE_HOOK="$HOOKS_TEMPLATE_DIR/$hook"
     PROJECT_HOOK="$PROJECT_HOOKS_DIR/$hook"
@@ -109,12 +110,32 @@ for hook in "${HOOKS_TO_INSTALL[@]}"; do
         chmod +x "$PROJECT_HOOK"
         HOOKS_INSTALLED=$((HOOKS_INSTALLED + 1))
     else
-        echo -e "${GREEN}  ✓ $hook already installed${NC}"
+        # Hook exists, check version
+        TEMPLATE_VERSION=$(grep -E '^HOOK_VERSION = |^Version: ' "$TEMPLATE_HOOK" 2>/dev/null | head -1 | sed -E 's/.*"([0-9.]+)".*/\1/; s/.*Version: ([0-9.]+).*/\1/')
+        PROJECT_VERSION=$(grep -E '^HOOK_VERSION = |^Version: ' "$PROJECT_HOOK" 2>/dev/null | head -1 | sed -E 's/.*"([0-9.]+)".*/\1/; s/.*Version: ([0-9.]+).*/\1/')
+
+        if [ -n "$TEMPLATE_VERSION" ] && [ -n "$PROJECT_VERSION" ] && [ "$TEMPLATE_VERSION" != "$PROJECT_VERSION" ]; then
+            echo -e "${YELLOW}  Updating $hook from v${PROJECT_VERSION} to v${TEMPLATE_VERSION}...${NC}"
+            cp "$TEMPLATE_HOOK" "$PROJECT_HOOK"
+            chmod +x "$PROJECT_HOOK"
+            HOOKS_UPDATED=$((HOOKS_UPDATED + 1))
+        elif [ -n "$PROJECT_VERSION" ]; then
+            echo -e "${GREEN}  ✓ $hook v${PROJECT_VERSION} is current${NC}"
+        else
+            # No version found, update to get versioned hook
+            echo -e "${YELLOW}  Updating $hook to versioned copy...${NC}"
+            cp "$TEMPLATE_HOOK" "$PROJECT_HOOK"
+            chmod +x "$PROJECT_HOOK"
+            HOOKS_UPDATED=$((HOOKS_UPDATED + 1))
+        fi
     fi
 done
 
 if [ $HOOKS_INSTALLED -gt 0 ]; then
-    echo -e "${GREEN}Installed $HOOKS_INSTALLED Slack hook file(s)${NC}"
+    echo -e "${GREEN}Installed $HOOKS_INSTALLED new hook file(s)${NC}"
+fi
+if [ $HOOKS_UPDATED -gt 0 ]; then
+    echo -e "${GREEN}Updated $HOOKS_UPDATED hook file(s)${NC}"
 fi
 
 # Step 3: Wait a bit for full stabilization
