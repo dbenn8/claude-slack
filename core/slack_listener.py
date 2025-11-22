@@ -318,17 +318,98 @@ def handle_message(event, say):
 
 
 @app.event("reaction_added")
-def handle_reaction(event):
+def handle_reaction(body, client):
     """
-    Handle emoji reactions (for future features)
+    Handle emoji reactions as quick numeric responses.
 
-    Could be used for:
-    - Acknowledging Claude's messages with 👍/👎
-    - Triggering specific actions with custom emoji
+    Maps emoji reactions to number inputs for fast permission responses:
+    - 1️⃣ / 👍 → "1" (approve this time)
+    - 2️⃣ → "2" (approve for session/project)
+    - 3️⃣ / 👎 → "3" (deny)
     """
-    # For now, just ignore reactions
-    # Phase 3: Use reactions as shortcuts (👍 = "1", 👎 = "3", etc.)
-    pass
+    # Extract the inner event payload from the body
+    event = body.get("event", {})
+
+    print(f"📌 Reaction event received: {event}", file=sys.stderr)
+
+    # Ignore bot's own reactions
+    try:
+        bot_user_id = client.auth_test()["user_id"]
+        if event.get("user") == bot_user_id:
+            print(f"📌 Ignoring bot's own reaction", file=sys.stderr)
+            return
+    except Exception as e:
+        print(f"⚠️  Could not check bot user id: {e}", file=sys.stderr)
+
+    emoji_name = event.get("reaction")
+    item = event.get("item", {})
+    channel = item.get("channel")
+    message_ts = item.get("ts")
+    user = event.get("user")
+
+    print(f"📌 Parsed: emoji={emoji_name}, channel={channel}, ts={message_ts}, user={user}", file=sys.stderr)
+
+    # Map emoji names to numeric responses
+    emoji_to_number = {
+        # Number emojis
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        # Thumbs emojis as shortcuts
+        "+1": "1",           # 👍 = approve
+        "thumbsup": "1",
+        "-1": "3",           # 👎 = deny
+        "thumbsdown": "3",
+        # Check/X emojis
+        "white_check_mark": "1",  # ✅ = approve
+        "x": "3",                  # ❌ = deny
+        "heavy_check_mark": "1",
+    }
+
+    response = emoji_to_number.get(emoji_name)
+    if not response:
+        # Unmapped emoji, ignore
+        return
+
+    # Get thread_ts for routing - need to find the THREAD's parent ts, not the message ts
+    # Fetch the message to get its thread_ts (parent of the thread)
+    thread_ts = None
+    try:
+        # Get the message that was reacted to
+        result = client.conversations_history(
+            channel=channel,
+            latest=message_ts,
+            inclusive=True,
+            limit=1
+        )
+        if result.get("messages"):
+            msg = result["messages"][0]
+            # thread_ts is the parent message ts (or the message itself if it's the parent)
+            thread_ts = msg.get("thread_ts", message_ts)
+            print(f"📌 Found thread_ts: {thread_ts} for message {message_ts}", file=sys.stderr)
+    except Exception as e:
+        print(f"⚠️  Could not fetch message for thread_ts: {e}", file=sys.stderr)
+        # Fall back to message_ts
+        thread_ts = message_ts
+
+    # Send the numeric response to Claude
+    mode = send_response(response, thread_ts=thread_ts)
+
+    # Log the reaction-to-input conversion
+    print(f"📌 Reaction '{emoji_name}' from user {user} → sent '{response}' via {mode}", file=sys.stderr)
+
+    # Add a checkmark to confirm the reaction was processed
+    try:
+        client.reactions_add(
+            channel=channel,
+            timestamp=message_ts,
+            name="white_check_mark"
+        )
+        print(f"📌 Added confirmation checkmark", file=sys.stderr)
+    except Exception as e:
+        print(f"⚠️  Could not add confirmation reaction: {e}", file=sys.stderr)
 
 
 def main():

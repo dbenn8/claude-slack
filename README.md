@@ -61,10 +61,12 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
+      - app_mention
       - message.channels
       - message.groups
       - message.im
       - message.mpim
+      - reaction_added
   interactivity:
     is_enabled: false
   org_deploy_enabled: false
@@ -152,19 +154,22 @@ After adding `~/.claude/claude-slack/bin` to your PATH:
 
 ## Troubleshooting
 
-### Socket Starvation Issue
+### Quick Emoji Responses
 
-**Symptom**: Message sent to Slack but no green checkmark appears, Claude doesn't respond
+Permission prompts now show 1️⃣ 2️⃣ 3️⃣ emoji reactions - just tap to respond! Requires:
+- `reactions:read` scope (included in manifest above)
+- `reaction_added` event subscription (included in manifest above)
 
-**Root Cause**: Socket communication starvation - the connection between Slack listener and Claude session becomes unresponsive
+### Socket Starvation Issue (FIXED)
 
-**Workaround**:
-- Send an @ mention to your bot.  Make the @ mention the FIRST word in your message (e.g., `@claudebot your message here`)
-- The @ mention "wakes up" the listener and re-establishes communication
-- After the @ mention, regular messages should work again
-- Occasionally, its flakey enough that you need to copy paste your message and send it again to wake it up.
+**Previous issue**: Messages sometimes not received, requiring @ mentions to "wake up" the listener.
 
-**Long-term solution**: Under investigation
+**Solution applied**:
+- Increased socket backlog from 1 to 128 connections
+- Added retry logic with exponential backoff
+- Added proper socket timeout handling
+
+If you still experience issues, ensure your Slack app has all the scopes and events from the manifest above.
 
 ### Checking Logs
 
@@ -261,8 +266,8 @@ This integration uses three Claude Code hooks:
 
 ## Known Limitations
 
-- Socket starvation issue requires @ mention workaround
-- ~~Notifications from Claude aren't printing full content~~ **SOLVED!** ✅
+- ~~Socket starvation issue requires @ mention workaround~~ **FIXED!**
+- ~~Notifications from Claude aren't printing full content~~ **FIXED!**
   - PreToolUse hook now provides complete context for all permission requests
   - See actual bash commands, file contents, and tool parameters before approving
 

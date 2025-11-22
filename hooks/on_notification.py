@@ -1007,7 +1007,7 @@ def enhance_notification_message(
     return enhanced
 
 
-def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
+def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_number_reactions: bool = False):
     """
     Post message to Slack thread, handling long messages.
 
@@ -1016,6 +1016,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         thread_ts: Thread timestamp
         text: Message text
         bot_token: Slack bot token
+        add_number_reactions: If True, add 1️⃣ 2️⃣ 3️⃣ reactions for quick responses
     """
     try:
         from slack_sdk import WebClient
@@ -1036,6 +1037,8 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
 
     # Post each chunk
     failed_chunks = []
+    last_message_ts = None  # Track the last message for adding reactions
+
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -1044,11 +1047,14 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             else:
                 message_text = chunk
 
-            client.chat_postMessage(
+            response = client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=message_text
             )
+
+            # Save the message timestamp for adding reactions
+            last_message_ts = response.get("ts")
 
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
@@ -1060,6 +1066,27 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             log_error(f"Error posting chunk {i+1} to Slack: {e}")
             failed_chunks.append(i+1)
             continue
+
+    # Add number emoji reactions for quick responses (on last message only)
+    if add_number_reactions and last_message_ts:
+        import time
+        debug_log("Adding number emoji reactions for quick response", "SLACK")
+        number_emojis = ["one", "two", "three"]  # 1️⃣ 2️⃣ 3️⃣
+
+        for emoji in number_emojis:
+            try:
+                client.reactions_add(
+                    channel=channel,
+                    timestamp=last_message_ts,
+                    name=emoji
+                )
+                debug_log(f"Added reaction: {emoji}", "SLACK")
+                time.sleep(0.15)  # Small delay to ensure reactions appear in order
+            except SlackApiError as e:
+                # Don't fail the whole operation if reactions fail
+                debug_log(f"Failed to add reaction {emoji}: {e.response.get('error', str(e))}", "SLACK")
+            except Exception as e:
+                debug_log(f"Error adding reaction {emoji}: {e}", "SLACK")
 
     if failed_chunks:
         log_error(f"Failed to post chunks: {failed_chunks}")
@@ -1209,7 +1236,10 @@ def main():
         debug_log(f"Enhanced message (first 200 chars): {enhanced_message[:200]}", "SLACK")
 
         # Post notification to Slack
-        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token)
+        # Add number emoji reactions for permission prompts (enables quick tap responses)
+        is_permission_prompt = notification_type == "permission_prompt"
+        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token,
+                               add_number_reactions=is_permission_prompt)
 
         if success:
             log_info("Successfully posted to Slack")
