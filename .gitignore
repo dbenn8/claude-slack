@@ -118,3 +118,6 @@ Temporary Items
 
 # Claude Code local configuration (auto-managed by claude-slack)
 .claude/
+
+# Test files
+test_permissions.sh

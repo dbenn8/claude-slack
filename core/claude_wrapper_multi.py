@@ -383,8 +383,10 @@ class ClaudeWrapperMulti:
 
         # Create Unix socket
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(self.socket_path)
-        self.socket.listen(1)
+        self.socket.listen(128)
+        self.socket.settimeout(1.0)  # Allow shutdown checks
 
         print(f"{CYAN}[Session {self.session_id}] Socket created: {self.socket_path}{RESET}", file=sys.stderr)
 
@@ -634,6 +636,10 @@ class ClaudeWrapperMulti:
                         time.sleep(0.1)
                         # Then send Enter key (carriage return)
                         os.write(self.master_fd, b'\r')
+
+            except socket.timeout:
+                # Timeout is expected - allows checking self.running flag
+                continue
 
             except Exception as e:
                 if self.running:
