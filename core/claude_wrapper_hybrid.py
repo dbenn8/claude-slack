@@ -464,8 +464,10 @@ class HybridPTYWrapper:
 
         # Create Unix socket
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind(self.socket_path)
-        self.socket.listen(1)
+        self.socket.listen(128)
+        self.socket.settimeout(1.0)  # Allow shutdown checks
         self.logger.info(f"Unix socket created and listening: {self.socket_path}")
 
         print(f"{GREEN}[Session {self.session_id}] Input socket: {self.socket_path}{RESET}", file=sys.stderr)
@@ -729,6 +731,9 @@ class HybridPTYWrapper:
 
                         debug_log("Input injected successfully")
 
+            except socket.timeout:
+                # Timeout allows periodic check of self.running flag
+                continue
             except Exception as e:
                 if self.running:
                     self.logger.error(f"Socket listener error: {e}", exc_info=True)

@@ -172,24 +172,33 @@ def send_response(text, thread_ts=None):
     if not socket_path:
         socket_path = SOCKET_PATH if os.path.exists(SOCKET_PATH) else None
 
-    # Try sending via socket
+    # Try sending via socket with retries
     if socket_path and os.path.exists(socket_path):
-        try:
-            # Connect to wrapper's Unix socket
-            client_socket = sock_module.socket(sock_module.AF_UNIX, sock_module.SOCK_STREAM)
-            client_socket.connect(socket_path)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Connect to wrapper's Unix socket
+                client_socket = sock_module.socket(sock_module.AF_UNIX, sock_module.SOCK_STREAM)
+                client_socket.settimeout(5.0)  # 5 second timeout
+                client_socket.connect(socket_path)
 
-            # Send response
-            client_socket.sendall(text.encode('utf-8'))
-            client_socket.close()
+                # Send response
+                client_socket.sendall(text.encode('utf-8'))
+                client_socket.close()
 
-            mode = "registry_socket" if thread_ts else "socket"
-            print(f"✅ Sent via {mode}: {text[:100]}", file=sys.stderr)
-            return mode
+                mode = "registry_socket" if thread_ts else "socket"
+                print(f"✅ Sent via {mode}: {text[:100]}", file=sys.stderr)
+                return mode
 
-        except Exception as e:
-            print(f"⚠️  Socket send failed, falling back to file: {e}", file=sys.stderr)
-            # Fall through to file mode
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (3 ** attempt)  # 0.1s, 0.3s, 0.9s
+                    print(f"⚠️  Socket attempt {attempt + 1} failed, retrying in {backoff}s: {e}", file=sys.stderr)
+                    import time
+                    time.sleep(backoff)
+                else:
+                    print(f"⚠️  Socket send failed after {max_retries} attempts, falling back to file: {e}", file=sys.stderr)
+                    # Fall through to file mode
 
     # Fall back to Phase 1 (file)
     with open(RESPONSE_FILE, "w") as f:

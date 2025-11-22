@@ -425,8 +425,9 @@ class SessionRegistry:
         # Create server socket
         try:
             self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind(self.socket_path)
-            self.server_socket.listen(5)
+            self.server_socket.listen(128)
             self.running = True
             self._log(f"Listening on {self.socket_path}")
         except Exception as e:
