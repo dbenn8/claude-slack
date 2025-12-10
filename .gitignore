@@ -30,4 +30,6 @@ Thumbs.db
 *.bak
 
 # Claude Code local configuration (auto-managed by claude-slack)
-.claude/
+# But track hooks in this repo
+.claude/*
+!.claude/hooks/
