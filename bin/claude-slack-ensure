@@ -116,33 +116,45 @@ if [ "$REGISTRY_RUNNING" = false ]; then
     fi
 fi
 
-# Step 1: AGGRESSIVE MODE - Always kill and restart listener to ensure clean state
-# This prevents the scenario where listener is running from wrong location
-log "Ensuring clean Slack listener state..."
-echo -e "${YELLOW}Cleaning up existing listener processes...${NC}"
+# Step 1: Check if listener is already running and healthy
+# If managed by launchd, we don't want to kill it
+log "Checking Slack listener status..."
 
-# Kill any existing listener processes (from any location)
-pkill -9 -f "slack_listener.py" 2>/dev/null || true
-sleep 2
-
-# Step 2: Start fresh listener from universal location
-log "Starting Slack listener from universal location..."
-
-# Check if start script exists
-if [ ! -f "${SCRIPT_DIR}/claude-slack-listener" ]; then
-    echo -e "${RED}✗ Error: claude-slack-listener not found${NC}"
-    exit 1
+LISTENER_HEALTHY=false
+if pgrep -f "slack_listener.py" > /dev/null; then
+    # Process exists, check if it's responding (look for recent log activity or just trust it)
+    log "Listener process found, checking health..."
+    if [ -f "${SCRIPT_DIR}/claude-slack-health" ] && "${SCRIPT_DIR}/claude-slack-health" >/dev/null 2>&1; then
+        LISTENER_HEALTHY=true
+        log "✓ Listener already running and healthy"
+        echo -e "${GREEN}✓ Slack listener already running${NC}"
+    fi
 fi
 
-# Run the startup script
-echo -e "${YELLOW}Starting Slack listener...${NC}"
-if ! "${SCRIPT_DIR}/claude-slack-listener"; then
-    echo -e "${RED}✗ Failed to start Slack listener${NC}"
-    log "✗ Failed to start Slack listener"
-    exit 1
-fi
+# Step 2: Only start listener if not healthy
+if [ "$LISTENER_HEALTHY" = false ]; then
+    log "Listener not healthy, starting..."
+    echo -e "${YELLOW}Starting Slack listener...${NC}"
 
-log "✓ Successfully started Slack listener"
+    # Kill any existing unhealthy listener processes
+    pkill -9 -f "slack_listener.py" 2>/dev/null || true
+    sleep 2
+
+    # Check if start script exists
+    if [ ! -f "${SCRIPT_DIR}/claude-slack-listener" ]; then
+        echo -e "${RED}✗ Error: claude-slack-listener not found${NC}"
+        exit 1
+    fi
+
+    # Run the startup script
+    if ! "${SCRIPT_DIR}/claude-slack-listener"; then
+        echo -e "${RED}✗ Failed to start Slack listener${NC}"
+        log "✗ Failed to start Slack listener"
+        exit 1
+    fi
+
+    log "✓ Successfully started Slack listener"
+fi
 
 # Step 3: Wait for initialization
 log "Waiting for initialization..."

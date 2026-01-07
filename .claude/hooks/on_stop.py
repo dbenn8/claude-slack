@@ -2,6 +2,13 @@
 """
 Claude Code Stop Hook - Post Assistant Responses to Slack
 
+Version: 1.2.0
+
+Changelog:
+- v1.2.0: Added standby flag clearing - enables standby messages in PreToolUse hook
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
+
 Triggered when Claude finishes processing a user prompt.
 Reads the transcript, extracts the latest assistant response, and posts it to Slack.
 
@@ -14,7 +21,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -41,8 +48,15 @@ import os
 from pathlib import Path
 from datetime import datetime
 
+# Hook version for auto-update detection
+HOOK_VERSION = "1.2.0"
+
 # Debug log file path
 DEBUG_LOG = "/tmp/stop_hook_debug.log"
+
+# Standby flag settings (must match on_pretooluse.py)
+STANDBY_FLAG_DIR = "/tmp"
+STANDBY_FLAG_PREFIX = "claude_standby_"
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -180,6 +194,22 @@ def log_info(message: str):
     print(f"[on_stop.py] {message}", file=sys.stderr)
 
 
+def clear_standby_flag(session_id: str):
+    """
+    Remove the standby flag file for this session.
+
+    Called when the Stop hook fires to allow the next response
+    to send a new standby message.
+    """
+    flag_path = os.path.join(STANDBY_FLAG_DIR, f"{STANDBY_FLAG_PREFIX}{session_id}.flag")
+    try:
+        if os.path.exists(flag_path):
+            os.remove(flag_path)
+            debug_log(f"Cleared standby flag for session {session_id[:8]}", "STANDBY")
+    except Exception as e:
+        debug_log(f"Failed to clear standby flag: {e}", "STANDBY")
+
+
 def split_message(text: str, max_length: int = 39000) -> list:
     """
     Split long message into chunks that fit in Slack's 40K char limit.
@@ -241,6 +271,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         chunks = chunks[:5]
 
     # Post each chunk
+    failed_chunks = []
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -258,11 +289,17 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
         except SlackApiError as e:
-            log_error(f"Slack API error: {e.response['error']}")
-            return False
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
         except Exception as e:
-            log_error(f"Error posting to Slack: {e}")
-            return False
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
 
     return True
 
@@ -292,6 +329,9 @@ def main():
         if not session_id:
             log_error("No session_id in hook data")
             sys.exit(0)
+
+        # Clear standby flag - response is complete, next response can send new standby
+        clear_standby_flag(session_id)
 
         # Use transcript path from hook data, or construct from environment
         if not transcript_path:
@@ -359,8 +399,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.path.expanduser(os.environ.get("REGISTRY_DB_PATH", "~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
@@ -375,6 +414,14 @@ def main():
 
         if not session:
             log_error(f"Session {session_id[:8]} not found in registry")
+            sys.exit(0)
+
+        # Check if Slack mirroring is enabled for this session
+        # Handle both string ('true'/'false') and boolean values
+        slack_enabled = session.get("slack_enabled", True)
+        if slack_enabled in ("false", False, "False", 0, "0"):
+            log_info(f"Slack mirroring disabled for session {session_id[:8]}, skipping")
+            debug_log("slack_enabled=false, skipping Slack post", "REGISTRY")
             sys.exit(0)
 
         # Extract Slack metadata

@@ -121,3 +121,6 @@ Temporary Items
 
 # Test files
 test_permissions.sh
+
+# Prevent literal tilde directory (path bugs)
+~/

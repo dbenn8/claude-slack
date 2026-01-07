@@ -2,6 +2,12 @@
 """
 Claude Code Notification Hook - Post Notifications to Slack
 
+Version: 2.1.0
+
+Changelog:
+- v2.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v2.0.0 (2025/11/17): Added permission text mapping based on real prompts
+
 Triggered when Claude sends notifications (permission requests, user choices, idle prompts).
 Extracts the notification message from hook input and posts it to Slack.
 
@@ -26,7 +32,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -52,6 +58,9 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
+
+# Hook version (for auto-updates)
+HOOK_VERSION = "2.1.0"
 
 # Debug log file path
 DEBUG_LOG = "/tmp/notification_hook_debug.log"
@@ -525,6 +534,13 @@ CLAUDE_PERMISSION_TEXT = {
         "No, and tell Claude what to do differently (esc)"
     ],
 
+    # Task tool - Launching subagents
+    ("task_subagent", "Task", 3): [
+        "Yes",
+        "Yes, and don't ask again for similar Task operations",
+        "No, and tell Claude what to do differently (esc)"
+    ],
+
     # Fallback for unmatched contexts - 3 options
     ("default", None, 3): [
         "Yes",
@@ -561,6 +577,72 @@ DANGEROUS_PATTERNS = [
 # These errors occur even when user approves (chooses option 1)
 
 
+def extract_target_from_command(tool_name, tool_input):
+    """
+    Extract the specific target (file/directory/command) from tool input.
+    This is what Claude puts in the option 2 text.
+    """
+    import re
+    import os
+
+    if tool_name == "Bash":
+        command = tool_input.get('command', '')
+
+        # Extract directory from ls commands
+        if command.strip().startswith('ls'):
+            match = re.search(r'ls(?:\s+(?:-[a-zA-Z]+\s+)*)?([^\s]+)', command)
+            if match:
+                path = match.group(1).rstrip('/')
+                if '/' in path:
+                    # Return just the last directory component
+                    return os.path.basename(path)
+
+        # Extract command from sudo
+        if 'sudo' in command:
+            match = re.search(r'sudo\s+(\w+)', command)
+            if match:
+                return f"sudo {match.group(1)}"
+
+        # Extract filename from file operations
+        # Handle echo > file, touch file, etc
+        patterns = [
+            r'>\s*([^\s;&|]+)',  # Redirect
+            r'touch\s+([^\s;&|]+)',  # Touch
+            r'echo.*>\s*([^\s;&|]+)',  # Echo redirect
+            r'cat\s*>\s*([^\s<]+)\s*<<',  # Heredoc
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, command)
+            if match:
+                path = match.group(1)
+                # Return just the filename
+                return os.path.basename(path)
+
+    elif tool_name == "Write":
+        file_path = tool_input.get('file_path', '')
+        if file_path.startswith('../'):
+            # Extract directory from relative path
+            parts = file_path.split('/')
+            meaningful_parts = [p for p in parts[:-1] if p and p != '..']
+            if meaningful_parts:
+                return meaningful_parts[-1]
+
+    elif tool_name == "Edit":
+        file_path = tool_input.get('file_path', '')
+        if file_path.startswith('../'):
+            # Extract directory from relative path
+            parts = file_path.split('/')
+            meaningful_parts = [p for p in parts[:-1] if p and p != '..']
+            if meaningful_parts:
+                return meaningful_parts[-1]
+
+    elif tool_name == "Task":
+        # For Task tool, return generic
+        return "Task operations"
+
+    return None
+
+
 def determine_permission_context(tool_name, tool_input):
     """
     Determine the permission context based on tool and input.
@@ -594,8 +676,8 @@ def determine_permission_context(tool_name, tool_input):
             return ("bash_sudo", 3)
 
         # Check for directory listing/access (ls, cd to out-of-scope)
-        if re.search(r'\bls\b.*/(Desktop|Downloads|Documents|codeOLD)', command):
-            debug_log(f"Detected out-of-scope directory access: {command[:50]}", "PERMISSION")
+        if re.search(r'\bls\b', command):
+            debug_log(f"Detected directory access: {command[:50]}", "PERMISSION")
             return ("bash_directory_access", 3)
 
         # Check for file operations (echo >, touch, rm, etc.)
@@ -625,6 +707,10 @@ def determine_permission_context(tool_name, tool_input):
         # Read tool for file reading
         return ("read_file", 3)
 
+    elif tool_name == "Task":
+        # Task tool for launching subagents
+        return ("task_subagent", 3)
+
     else:
         # Unknown tool - use default
         return ("default", 3)
@@ -633,7 +719,7 @@ def determine_permission_context(tool_name, tool_input):
 def get_exact_permission_options(tool_name, tool_input, permission_mode="default"):
     """
     Get exact Claude permission options based on context.
-    Updated based on 14 real captured permission prompts.
+    Generates EXACT text, not templates.
 
     Args:
         tool_name: Name of tool requiring permission
@@ -641,40 +727,81 @@ def get_exact_permission_options(tool_name, tool_input, permission_mode="default
         permission_mode: Permission mode from PreToolUse hook (default, acceptEdits, plan)
 
     Returns:
-        List of exact permission option strings, or None if not found
+        List of exact permission option strings
     """
+    import os
+
     # Determine context and expected option count
     context_type, expected_options = determine_permission_context(tool_name, tool_input)
 
-    # Try to find exact match with context
-    key = (context_type, tool_name, expected_options)
-    if key in CLAUDE_PERMISSION_TEXT:
-        options = CLAUDE_PERMISSION_TEXT[key]
-        debug_log(f"Found CONTEXT match: context={context_type}, tool={tool_name}, options={expected_options}", "PERMISSION")
-        return options
+    # Extract the actual target from the command
+    target = extract_target_from_command(tool_name, tool_input)
 
-    # Try fallback for option count
+    # Get project directory dynamically from environment or cwd
+    project_dir = os.environ.get('CLAUDE_PROJECT_DIR', os.getcwd())
+
+    # For 2-option scenarios (background process, /tmp operations)
     if expected_options == 2:
-        key = ("default_2_option", None, 2)
-    else:
-        key = ("default", None, 3)
+        debug_log(f"Generating 2 options for {context_type}", "PERMISSION")
+        return [
+            "Yes",
+            "No, and tell Claude what to do differently (esc)"
+        ]
 
-    if key in CLAUDE_PERMISSION_TEXT:
-        options = CLAUDE_PERMISSION_TEXT[key]
-        debug_log(f"Using FALLBACK for {expected_options} options", "PERMISSION")
-        return options
+    # Generate exact option 2 text based on context and extracted target
+    option_2_text = None
 
-    # Ultimate fallback (shouldn't reach here with updated mappings)
-    if expected_options == 2:
-        options = ["Yes", "No, and tell Claude what to do differently (esc)"]
+    if tool_name == "Bash":
+        command = tool_input.get('command', '')
+
+        # Directory access (ls commands)
+        if context_type == "bash_directory_access" and target:
+            option_2_text = f"Yes, allow reading from {target}/ from this project"
+            debug_log(f"Generated directory access text for: {target}", "PERMISSION")
+
+        # Sudo commands
+        elif context_type == "bash_sudo" and target and target.startswith("sudo "):
+            cmd_part = target.replace("sudo ", "")
+            option_2_text = f"Yes, and don't ask again for sudo {cmd_part} commands in {project_dir}"
+            debug_log(f"Generated sudo text for: {cmd_part}", "PERMISSION")
+
+        # File operations
+        elif context_type == "bash_file_commands" and target:
+            option_2_text = f"Yes, and don't ask again for {target} commands in {project_dir}"
+            debug_log(f"Generated file command text for: {target}", "PERMISSION")
+
+    elif tool_name == "Write" and target:
+        # Write tool - allow edits in directory
+        option_2_text = f"Yes, allow all edits in {target}/ during this session"
+        debug_log(f"Generated Write text for directory: {target}", "PERMISSION")
+
+    elif tool_name == "Edit" and target:
+        # Edit tool - allow edits in directory
+        option_2_text = f"Yes, allow all edits in {target}/ during this session"
+        debug_log(f"Generated Edit text for directory: {target}", "PERMISSION")
+
+    elif tool_name == "Task":
+        # Task tool - generic for subagents
+        option_2_text = "Yes, and don't ask again for similar Task operations"
+        debug_log(f"Generated Task text", "PERMISSION")
+
+    # Build the full options list
+    if option_2_text:
+        options = [
+            "Yes",
+            option_2_text,
+            "No, and tell Claude what to do differently (esc)"
+        ]
+        debug_log(f"Generated EXACT text: {option_2_text[:50]}...", "PERMISSION")
     else:
+        # Fallback if we couldn't generate specific text
         options = [
             "Yes",
             "Yes, and don't ask again for this operation",
             "No, and tell Claude what to do differently (esc)"
         ]
+        debug_log(f"Using fallback for {tool_name} - couldn't extract target", "PERMISSION")
 
-    debug_log(f"Using ULTIMATE FALLBACK: {expected_options} options", "PERMISSION")
     return options
 
 
@@ -880,7 +1007,7 @@ def enhance_notification_message(
     return enhanced
 
 
-def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
+def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_number_reactions: bool = False):
     """
     Post message to Slack thread, handling long messages.
 
@@ -889,6 +1016,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         thread_ts: Thread timestamp
         text: Message text
         bot_token: Slack bot token
+        add_number_reactions: If True, add 1️⃣ 2️⃣ 3️⃣ reactions for quick responses
     """
     try:
         from slack_sdk import WebClient
@@ -908,6 +1036,9 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         chunks = chunks[:5]
 
     # Post each chunk
+    failed_chunks = []
+    last_message_ts = None  # Track the last message for adding reactions
+
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -916,20 +1047,50 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             else:
                 message_text = chunk
 
-            client.chat_postMessage(
+            response = client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=message_text
             )
 
+            # Save the message timestamp for adding reactions
+            last_message_ts = response.get("ts")
+
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
         except SlackApiError as e:
-            log_error(f"Slack API error: {e.response['error']}")
-            return False
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
         except Exception as e:
-            log_error(f"Error posting to Slack: {e}")
-            return False
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    # Add number emoji reactions for quick responses (on last message only)
+    if add_number_reactions and last_message_ts:
+        import time
+        debug_log("Adding number emoji reactions for quick response", "SLACK")
+        number_emojis = ["one", "two", "three"]  # 1️⃣ 2️⃣ 3️⃣
+
+        for emoji in number_emojis:
+            try:
+                client.reactions_add(
+                    channel=channel,
+                    timestamp=last_message_ts,
+                    name=emoji
+                )
+                debug_log(f"Added reaction: {emoji}", "SLACK")
+                time.sleep(0.15)  # Small delay to ensure reactions appear in order
+            except SlackApiError as e:
+                # Don't fail the whole operation if reactions fail
+                debug_log(f"Failed to add reaction {emoji}: {e.response.get('error', str(e))}", "SLACK")
+            except Exception as e:
+                debug_log(f"Error adding reaction {emoji}: {e}", "SLACK")
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
 
     return True
 
@@ -962,6 +1123,11 @@ def main():
                 notification_type = "idle_prompt"
                 debug_log("Inferred notification_type as idle_prompt from message content", "INPUT")
 
+        # Skip idle_prompt notifications - they're noisy and not useful for remote work
+        if notification_type == "idle_prompt":
+            debug_log("Skipping idle_prompt notification (disabled)", "INPUT")
+            sys.exit(0)
+
         debug_log(f"session_id: {session_id}", "INPUT")
         debug_log(f"notification_message: {notification_message}", "INPUT")
         debug_log(f"notification_type: {notification_type}", "INPUT")
@@ -988,8 +1154,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.path.expanduser(os.environ.get("REGISTRY_DB_PATH", "~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
@@ -1004,6 +1169,14 @@ def main():
 
         if not session:
             log_error(f"Session {session_id[:8]} not found in registry")
+            sys.exit(0)
+
+        # Check if Slack mirroring is enabled for this session
+        # Handle both string ('true'/'false') and boolean values
+        slack_enabled = session.get("slack_enabled", True)
+        if slack_enabled in ("false", False, "False", 0, "0"):
+            log_info(f"Slack mirroring disabled for session {session_id[:8]}, skipping")
+            debug_log("slack_enabled=false, skipping Slack post", "REGISTRY")
             sys.exit(0)
 
         # Extract Slack metadata
@@ -1075,7 +1248,10 @@ def main():
         debug_log(f"Enhanced message (first 200 chars): {enhanced_message[:200]}", "SLACK")
 
         # Post notification to Slack
-        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token)
+        # Add number emoji reactions for permission prompts (enables quick tap responses)
+        is_permission_prompt = notification_type == "permission_prompt"
+        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token,
+                               add_number_reactions=is_permission_prompt)
 
         if success:
             log_info("Successfully posted to Slack")

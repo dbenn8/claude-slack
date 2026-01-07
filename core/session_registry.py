@@ -628,6 +628,32 @@ class SessionRegistry:
     # Slack Integration
     # ========================================
 
+    def _get_git_branch(self, project: str) -> str:
+        """Get current git branch for project directory."""
+        import subprocess
+        try:
+            # Try to find project dir - check common locations
+            possible_paths = [
+                os.path.expanduser(f"~/Dev/{project}"),
+                os.path.expanduser(f"~/Dev/contrib/{project}"),
+                os.path.expanduser(f"~/Dev/projects/{project}"),
+                os.getcwd(),
+            ]
+            for path in possible_paths:
+                if os.path.isdir(os.path.join(path, ".git")):
+                    result = subprocess.run(
+                        ["git", "branch", "--show-current"],
+                        cwd=path,
+                        capture_output=True,
+                        text=True,
+                        timeout=2
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.strip()
+            return "unknown"
+        except Exception:
+            return "unknown"
+
     def _create_slack_thread(self, session_data: Dict[str, Any]) -> Dict[str, str]:
         """
         Create Slack thread for new session (simplified for hooks-based system)
@@ -638,13 +664,20 @@ class SessionRegistry:
         if not self.slack_client:
             raise RuntimeError("Slack client not initialized")
 
-        # Create simple parent message in channel (no status tracking)
+        project = session_data.get('project', 'Unknown')
+        session_id = session_data['session_id']
+        terminal = session_data.get('terminal', 'Unknown')
+        git_branch = self._get_git_branch(project)
+        start_time = datetime.now().strftime('%H:%M')
+
+        # Create enhanced parent message with control buttons
         blocks = [
             {
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"🚀 {session_data.get('project', 'Unknown')}"
+                    "text": f"🚀 {project}",
+                    "emoji": True
                 }
             },
             {
@@ -652,11 +685,61 @@ class SessionRegistry:
                 "fields": [
                     {
                         "type": "mrkdwn",
-                        "text": f"*Session:* `{session_data['session_id'][:12]}...`"
+                        "text": f"*Branch:* `{git_branch}`"
                     },
                     {
                         "type": "mrkdwn",
-                        "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
+                        "text": f"*Started:* {start_time}"
+                    }
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Session `{session_id[:8]}` • {terminal}"
+                    }
+                ]
+            },
+            {
+                "type": "divider"
+            },
+            {
+                "type": "actions",
+                "block_id": f"session_controls_{session_id[:8]}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "✅ On",
+                            "emoji": True
+                        },
+                        "style": "primary",
+                        "action_id": "slack_mirror_on",
+                        "value": session_id
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "❌ Off",
+                            "emoji": True
+                        },
+                        "style": "danger",
+                        "action_id": "slack_mirror_off",
+                        "value": session_id
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "📊 Status",
+                            "emoji": True
+                        },
+                        "action_id": "slack_mirror_status",
+                        "value": session_id
                     }
                 ]
             }
@@ -664,7 +747,7 @@ class SessionRegistry:
 
         response = self.slack_client.chat_postMessage(
             channel=self.slack_channel,
-            text=f"New Session: {session_data.get('project', 'Unknown')}",
+            text=f"New Session: {project} ({git_branch})",
             blocks=blocks
         )
 

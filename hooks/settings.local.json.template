@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/on_pretooluse.py",
+            "command": "$HOME/.claude/claude-slack/.venv/bin/python3 $HOME/.claude/claude-slack/hooks/on_pretooluse.py",
             "timeout": 5
           }
         ]
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/on_stop.py"
+            "command": "$HOME/.claude/claude-slack/.venv/bin/python3 $HOME/.claude/claude-slack/hooks/on_stop.py"
           }
         ]
       }
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/on_notification.py"
+            "command": "$HOME/.claude/claude-slack/.venv/bin/python3 $HOME/.claude/claude-slack/hooks/on_notification.py"
           }
         ]
       }

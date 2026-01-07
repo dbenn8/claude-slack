@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-slack.listener</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{HOME}}/.claude/claude-slack/.venv/bin/python3</string>
+        <string>-u</string>
+        <string>{{HOME}}/.claude/claude-slack/core/slack_listener.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.claude/claude-slack</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.claude/slack/logs/launchd_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.claude/slack/logs/launchd_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>SLACK_BOT_TOKEN</key>
+        <string>{{SLACK_BOT_TOKEN}}</string>
+        <key>SLACK_APP_TOKEN</key>
+        <string>{{SLACK_APP_TOKEN}}</string>
+        <key>SLACK_CHANNEL</key>
+        <string>{{SLACK_CHANNEL}}</string>
+    </dict>
+</dict>
+</plist>

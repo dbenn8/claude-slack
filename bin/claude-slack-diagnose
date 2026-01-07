@@ -89,7 +89,7 @@ echo "────────────────────────�
 
 # Check .env file
 echo -n "  .env file: "
-ENV_FILE="${CORE_DIR}/.env"
+ENV_FILE="${INTEGRATION_DIR}/.env"
 if [ -f "$ENV_FILE" ]; then
     echo -e "${GREEN}✓ Found${NC}"
 
@@ -176,9 +176,10 @@ echo -e "${CYAN}5. LOG FILES${NC}"
 echo "─────────────────────────────────"
 
 LOG_FILES=(
-    "$SLACK_LOG_DIR/slack_listener.log"
-    "$SLACK_LOG_DIR/slack_listener_startup.log"
-    "$SLACK_LOG_DIR/ensure_listener.log"
+    "$SLACK_LOG_DIR/launchd_stdout.log"
+    "$SLACK_LOG_DIR/launchd_stderr.log"
+    "$SLACK_LOG_DIR/registry_stdout.log"
+    "$SLACK_LOG_DIR/registry_stderr.log"
 )
 
 for LOG in "${LOG_FILES[@]}"; do
@@ -197,6 +198,44 @@ for LOG in "${LOG_FILES[@]}"; do
         echo -e "${YELLOW}○ Not found${NC}"
     fi
 done
+
+echo ""
+
+# 5.5. Claude Code Settings
+echo -e "${CYAN}5.5. CLAUDE CODE SETTINGS${NC}"
+echo "─────────────────────────────────"
+
+CLAUDE_SETTINGS="$HOME/.claude/settings.local.json"
+echo -n "  settings.local.json: "
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    echo -e "${GREEN}✓ Found${NC}"
+
+    # Check for claude-slack hooks
+    echo -n "    claude-slack hooks: "
+    if grep -q "claude-slack" "$CLAUDE_SETTINGS" 2>/dev/null; then
+        HOOK_COUNT=$(grep -c "claude-slack" "$CLAUDE_SETTINGS" 2>/dev/null || echo "0")
+        echo -e "${GREEN}✓ Configured ($HOOK_COUNT references)${NC}"
+    else
+        echo -e "${RED}✗ Not configured${NC}"
+        OVERALL_STATUS="BROKEN"
+        ISSUES+=("Claude Code hooks not configured")
+    fi
+
+    # Check hook paths exist
+    echo -n "    Hook files: "
+    HOOKS_DIR="$HOME/.claude/claude-slack/hooks"
+    if [ -d "$HOOKS_DIR" ]; then
+        HOOK_FILES=$(ls -1 "$HOOKS_DIR"/*.py 2>/dev/null | wc -l | tr -d ' ')
+        echo -e "${GREEN}✓ $HOOK_FILES Python hooks found${NC}"
+    else
+        echo -e "${RED}✗ Hooks directory not found${NC}"
+        ISSUES+=("Hooks directory missing: $HOOKS_DIR")
+    fi
+else
+    echo -e "${RED}✗ Not found${NC}"
+    OVERALL_STATUS="BROKEN"
+    ISSUES+=("Claude Code settings not configured")
+fi
 
 echo ""
 

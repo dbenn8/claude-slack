@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# Toggle Slack mirroring for Claude Code sessions
+#
+# Usage:
+#   claude-slack-toggle on|off [session_id]
+#   claude-slack-toggle status
+#
+# If no session_id is provided, toggles all active sessions.
+#
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load environment
+ENV_FILE="$INTEGRATION_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+fi
+
+REGISTRY_DB_PATH=${REGISTRY_DB_PATH:-"$HOME/.claude/slack/registry.db"}
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: claude-slack-toggle <command> [session_id]"
+    echo ""
+    echo "Commands:"
+    echo "  on|enable     Enable Slack mirroring"
+    echo "  off|disable   Disable Slack mirroring"
+    echo "  status        Show current status"
+    echo ""
+    echo "If session_id is omitted, applies to all active sessions."
+    exit 1
+}
+
+if [ $# -lt 1 ]; then
+    usage
+fi
+
+COMMAND="$1"
+SESSION_ID="$2"
+
+# Check if database exists
+if [ ! -f "$REGISTRY_DB_PATH" ]; then
+    echo -e "${RED}Error: Registry database not found at $REGISTRY_DB_PATH${NC}"
+    echo "Is the Slack listener running?"
+    exit 1
+fi
+
+case "$COMMAND" in
+    on|enable)
+        if [ -n "$SESSION_ID" ]; then
+            sqlite3 "$REGISTRY_DB_PATH" "UPDATE sessions SET slack_enabled='true' WHERE session_id='$SESSION_ID';"
+            echo -e "${GREEN}✓ Slack mirroring ENABLED for session $SESSION_ID${NC}"
+        else
+            sqlite3 "$REGISTRY_DB_PATH" "UPDATE sessions SET slack_enabled='true' WHERE status='active';"
+            COUNT=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions WHERE status='active';")
+            echo -e "${GREEN}✓ Slack mirroring ENABLED for $COUNT active session(s)${NC}"
+        fi
+        ;;
+    off|disable)
+        if [ -n "$SESSION_ID" ]; then
+            sqlite3 "$REGISTRY_DB_PATH" "UPDATE sessions SET slack_enabled='false' WHERE session_id='$SESSION_ID';"
+            echo -e "${YELLOW}✓ Slack mirroring DISABLED for session $SESSION_ID${NC}"
+        else
+            sqlite3 "$REGISTRY_DB_PATH" "UPDATE sessions SET slack_enabled='false' WHERE status='active';"
+            COUNT=$(sqlite3 "$REGISTRY_DB_PATH" "SELECT COUNT(*) FROM sessions WHERE status='active';")
+            echo -e "${YELLOW}✓ Slack mirroring DISABLED for $COUNT active session(s)${NC}"
+        fi
+        ;;
+    status)
+        echo "Active sessions:"
+        echo ""
+        sqlite3 -header -column "$REGISTRY_DB_PATH" \
+            "SELECT session_id, project, slack_enabled, status FROM sessions WHERE status='active';"
+        ;;
+    *)
+        usage
+        ;;
+esac

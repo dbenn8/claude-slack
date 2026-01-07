@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Claude Code PreToolUse Hook - Capture AskUserQuestion calls to Slack
+Claude Code PreToolUse Hook - Capture AskUserQuestion calls and standby messages
+
+Version: 1.2.0
+
+Changelog:
+- v1.2.0: Added standby message feature - posts "Working..." on first tool call
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
 
 Triggered before Claude executes any tool, allowing us to capture AskUserQuestion
 calls with their full question text and options, which are not available in the
@@ -31,7 +38,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Architecture:
     1. Read hook data from stdin
@@ -48,8 +55,17 @@ Debug Logging:
 import sys
 import json
 import os
+import time
 from pathlib import Path
 from datetime import datetime
+
+# Hook version for auto-update detection
+HOOK_VERSION = "1.2.0"
+
+# Standby message settings
+STANDBY_FLAG_DIR = "/tmp"
+STANDBY_FLAG_PREFIX = "claude_standby_"
+STANDBY_MAX_AGE_SECONDS = 300  # 5 minutes - reset standby flag after this
 
 # Debug log file path
 DEBUG_LOG = "/tmp/pretooluse_hook_debug.log"
@@ -213,8 +229,49 @@ def format_askuserquestion_for_slack(tool_input: dict) -> str:
     return "\n".join(lines)
 
 
+def split_message(text: str, max_length: int = 39000) -> list:
+    """
+    Split long message into chunks that fit in Slack's 40K char limit.
+
+    Args:
+        text: Message text to split
+        max_length: Max chars per chunk (default: 39000, leaves room for part indicators)
+
+    Returns:
+        List of text chunks
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    while text:
+        # Find a good breaking point (newline near max_length)
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        # Look for newline near the max length
+        break_point = text.rfind('\n', max_length - 500, max_length)
+        if break_point == -1:
+            # No newline found, just split at max_length
+            break_point = max_length
+
+        chunks.append(text[:break_point])
+        text = text[break_point:].lstrip('\n')
+
+    return chunks
+
+
 def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
-    """Post message to Slack thread."""
+    """
+    Post message to Slack thread, handling long messages.
+
+    Args:
+        channel: Slack channel ID
+        thread_ts: Thread timestamp
+        text: Message text
+        bot_token: Slack bot token
+    """
     try:
         from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
@@ -224,21 +281,98 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
 
     client = WebClient(token=bot_token)
 
-    try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=text
-        )
-        log_info("Posted to Slack")
-        return True
+    # Split message if too long
+    chunks = split_message(text)
 
-    except SlackApiError as e:
-        log_error(f"Slack API error: {e.response['error']}")
+    if len(chunks) > 5:
+        # Too many chunks, truncate
+        log_info(f"Message too long ({len(chunks)} chunks), truncating to 5 chunks")
+        chunks = chunks[:5]
+
+    # Post each chunk
+    failed_chunks = []
+    for i, chunk in enumerate(chunks):
+        try:
+            # Add part indicator for multi-part messages
+            if len(chunks) > 1:
+                message_text = f"{chunk}\n\n_(Part {i+1}/{len(chunks)})_"
+            else:
+                message_text = chunk
+
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=message_text
+            )
+
+            log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
+
+        except SlackApiError as e:
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
+        except Exception as e:
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
+
+    return True
+
+
+def get_standby_flag_path(session_id: str) -> str:
+    """Get the path for the standby flag file for this session."""
+    return os.path.join(STANDBY_FLAG_DIR, f"{STANDBY_FLAG_PREFIX}{session_id}.flag")
+
+
+def try_claim_standby(session_id: str) -> bool:
+    """
+    Atomically check and claim the standby slot for this session.
+
+    Uses exclusive file creation to prevent race conditions where
+    multiple tool calls fire before the first one creates the flag.
+
+    Returns True if we claimed the slot (should send standby).
+    Returns False if someone else already claimed it.
+    """
+    flag_path = get_standby_flag_path(session_id)
+
+    # Check if flag exists and is fresh
+    if os.path.exists(flag_path):
+        try:
+            flag_age = time.time() - os.path.getmtime(flag_path)
+            if flag_age <= STANDBY_MAX_AGE_SECONDS:
+                return False  # Flag exists and is fresh, don't send
+        except Exception:
+            pass
+
+    # Try to atomically create the flag file
+    # O_CREAT | O_EXCL fails if file already exists
+    try:
+        fd = os.open(flag_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(fd)
+        debug_log(f"Claimed standby slot for session {session_id[:8]}", "STANDBY")
+        return True
+    except FileExistsError:
+        # Another hook instance beat us to it
+        debug_log(f"Standby slot already claimed for session {session_id[:8]}", "STANDBY")
         return False
     except Exception as e:
-        log_error(f"Error posting to Slack: {e}")
+        debug_log(f"Error claiming standby slot: {e}", "STANDBY")
         return False
+
+
+def clear_standby_flag(session_id: str):
+    """Remove the standby flag (called by Stop hook when response completes)."""
+    flag_path = get_standby_flag_path(session_id)
+    try:
+        if os.path.exists(flag_path):
+            os.remove(flag_path)
+    except Exception:
+        pass
 
 
 def main():
@@ -262,19 +396,34 @@ def main():
         debug_log(f"session_id: {session_id}", "INPUT")
         debug_log(f"tool_name: {tool_name}", "INPUT")
 
-        # Only process AskUserQuestion calls
-        if tool_name != "AskUserQuestion":
-            debug_log(f"Skipping tool: {tool_name}", "FILTER")
-            sys.exit(0)
-
-        log_info(f"Processing AskUserQuestion for session {session_id[:8] if session_id else 'unknown'}")
-
         if not session_id:
             log_error("No session_id in hook data")
             sys.exit(0)
 
-        # Format the question for Slack
-        slack_message = format_askuserquestion_for_slack(tool_input)
+        # Check if we should send a standby message (first tool call of response)
+        # Uses atomic file creation to prevent race conditions
+        is_askuser = tool_name == "AskUserQuestion"
+        send_standby = try_claim_standby(session_id) if not is_askuser else False
+
+        # Skip if neither standby nor AskUserQuestion
+        if not send_standby and not is_askuser:
+            debug_log(f"Skipping tool: {tool_name} (standby already sent)", "FILTER")
+            sys.exit(0)
+
+        debug_log(f"send_standby={send_standby}, is_askuser={is_askuser}", "FILTER")
+        log_info(f"Processing for session {session_id[:8]}: standby={send_standby}, askuser={is_askuser}")
+
+        # Determine what message to send
+        if is_askuser:
+            # Format the question for Slack
+            slack_message = format_askuserquestion_for_slack(tool_input)
+        elif send_standby:
+            # Send standby message for long-running operations
+            slack_message = "⏳ _Working on it..._"
+        else:
+            # This shouldn't happen given the filter above, but just in case
+            debug_log("No message to send (shouldn't reach here)", "FILTER")
+            sys.exit(0)
         debug_log(f"Formatted message (first 200 chars): {slack_message[:200]}", "FORMAT")
 
         # Query registry database for session metadata
@@ -286,8 +435,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.path.expanduser(os.environ.get("REGISTRY_DB_PATH", "~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
@@ -302,6 +450,14 @@ def main():
 
         if not session:
             log_error(f"Session {session_id[:8]} not found in registry")
+            sys.exit(0)
+
+        # Check if Slack mirroring is enabled for this session
+        # Note: Database stores "true"/"false" as strings, not booleans
+        slack_enabled = session.get("slack_enabled", "true")
+        if slack_enabled == "false" or slack_enabled is False:
+            log_info(f"Slack mirroring disabled for session {session_id[:8]}, skipping")
+            debug_log("slack_enabled=false, skipping Slack post", "REGISTRY")
             sys.exit(0)
 
         # Extract Slack metadata
@@ -358,6 +514,7 @@ def main():
         if success:
             log_info("Successfully posted to Slack")
             debug_log("Slack post successful", "SLACK")
+            # Note: standby flag already created atomically in try_claim_standby()
         else:
             log_info("Failed to post to Slack (see errors above)")
             debug_log("Slack post failed", "SLACK")

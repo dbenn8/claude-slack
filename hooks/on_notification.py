@@ -737,8 +737,8 @@ def get_exact_permission_options(tool_name, tool_input, permission_mode="default
     # Extract the actual target from the command
     target = extract_target_from_command(tool_name, tool_input)
 
-    # Get project directory (hardcoded based on analysis)
-    project_dir = "/Users/danielbennett/codeNew/.claude/claude-slack"
+    # Get project directory dynamically from environment or cwd
+    project_dir = os.environ.get('CLAUDE_PROJECT_DIR', os.getcwd())
 
     # For 2-option scenarios (background process, /tmp operations)
     if expected_options == 2:
@@ -1123,6 +1123,11 @@ def main():
                 notification_type = "idle_prompt"
                 debug_log("Inferred notification_type as idle_prompt from message content", "INPUT")
 
+        # Skip idle_prompt notifications - they're noisy and not useful for remote work
+        if notification_type == "idle_prompt":
+            debug_log("Skipping idle_prompt notification (disabled)", "INPUT")
+            sys.exit(0)
+
         debug_log(f"session_id: {session_id}", "INPUT")
         debug_log(f"notification_message: {notification_message}", "INPUT")
         debug_log(f"notification_type: {notification_type}", "INPUT")
@@ -1149,7 +1154,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
+        db_path = os.path.expanduser(os.environ.get("REGISTRY_DB_PATH", "~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
@@ -1164,6 +1169,14 @@ def main():
 
         if not session:
             log_error(f"Session {session_id[:8]} not found in registry")
+            sys.exit(0)
+
+        # Check if Slack mirroring is enabled for this session
+        # Handle both string ('true'/'false') and boolean values
+        slack_enabled = session.get("slack_enabled", True)
+        if slack_enabled in ("false", False, "False", 0, "0"):
+            log_info(f"Slack mirroring disabled for session {session_id[:8]}, skipping")
+            debug_log("slack_enabled=false, skipping Slack post", "REGISTRY")
             sys.exit(0)
 
         # Extract Slack metadata

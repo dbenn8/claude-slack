@@ -146,6 +146,11 @@ sleep 2
 echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
 echo ""
 
-# Pass all arguments through to the Python wrapper
+# Pass all arguments through to the Python wrapper (use venv if available)
 cd "$PROJECT_DIR"
-exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+VENV_PYTHON="${INTEGRATION_DIR}/.venv/bin/python3"
+if [ -x "$VENV_PYTHON" ]; then
+    exec "$VENV_PYTHON" "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+else
+    exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+fi

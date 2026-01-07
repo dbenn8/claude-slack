@@ -61,5 +61,10 @@ echo ""
 echo "   Press Ctrl+C to stop"
 echo ""
 
-# Run registry service
-exec python3 "$REGISTRY_PY"
+# Run registry service (use venv if available)
+VENV_PYTHON="${INTEGRATION_DIR}/.venv/bin/python3"
+if [ -x "$VENV_PYTHON" ]; then
+    exec "$VENV_PYTHON" "$REGISTRY_PY"
+else
+    exec python3 "$REGISTRY_PY"
+fi

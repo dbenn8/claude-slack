@@ -48,6 +48,7 @@ import logging
 import logging.handlers
 import fcntl
 import struct
+import uuid
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -119,9 +120,17 @@ def debug_log(message):
 
 
 def generate_session_id():
-    """Generate unique 8-character hex session ID"""
-    random_bytes = os.urandom(4)
-    return hashlib.sha256(random_bytes).hexdigest()[:8]
+    """Generate unique full UUID session ID.
+
+    Using full UUIDs ensures the same ID is used everywhere:
+    - Registry registration (creates Slack thread)
+    - Claude's --session-id argument
+    - Hook lookups
+
+    This prevents the mismatch where hooks receive Claude's UUID
+    but the registry only has the wrapper's short ID.
+    """
+    return str(uuid.uuid4())
 
 
 def detect_project_dir():
@@ -374,13 +383,15 @@ class RegistryClient:
             debug_log(f"Registry communication error: {e}")
             return None
 
-    def register(self, project, terminal, socket_path):
+    def register(self, project, terminal, socket_path, project_dir, wrapper_pid):
         """Register session with registry and create Slack thread"""
         data = {
             "session_id": self.session_id,
             "project": project,
             "terminal": terminal,
-            "socket_path": socket_path
+            "socket_path": socket_path,
+            "project_dir": project_dir,
+            "wrapper_pid": wrapper_pid
         }
 
         response = self._send_command("REGISTER", data)
@@ -438,7 +449,6 @@ class HybridPTYWrapper:
         # Thread info
         self.thread_ts = None
         self.channel = None
-        self.claude_session_registered = False  # Track if Claude's UUID was registered
 
         # Output buffer for capturing exact permission prompts (4KB ring buffer)
         # Increased from 1KB to 4KB to capture all 3 permission options
@@ -571,7 +581,9 @@ class HybridPTYWrapper:
         success = self.registry.register(
             project=os.path.basename(self.project_dir),
             terminal=terminal,
-            socket_path=self.socket_path
+            socket_path=self.socket_path,
+            project_dir=self.project_dir,
+            wrapper_pid=os.getpid()
         )
 
         if success:
@@ -706,13 +718,6 @@ class HybridPTYWrapper:
                         self.logger.info(f"Received input from Slack: {len(data)} chars")
                         self.logger.debug(f"Input content: {data[:100]}...")
                         debug_log(f"Received input from Slack ({len(data)} chars)")
-
-                        # On first message, retry Claude session registration if needed
-                        # This handles the case where thread_ts was None at startup
-                        if connections_received == 1 and not self.claude_session_registered:
-                            if hasattr(self, 'claude_session_uuid') and self.thread_ts:
-                                self.logger.info("First message received - retrying Claude session registration")
-                                self.register_claude_session(self.claude_session_uuid)
 
                         # Inject into Claude's stdin
                         # VibeTunnel mode: use queue (no PTY)
@@ -969,14 +974,12 @@ class HybridPTYWrapper:
             print(f"{RED}Error: Claude Code binary not found!{RESET}", file=sys.stderr)
             sys.exit(1)
 
-        # Generate a unique session ID for Claude to prevent resuming old sessions
-        import uuid
-        claude_session_uuid = str(uuid.uuid4())
-        self.claude_session_uuid = claude_session_uuid  # Store for later registration
-        self.logger.info(f"Forcing new Claude session with ID: {claude_session_uuid}")
+        # Use the same session ID for Claude (now a full UUID from generate_session_id)
+        # This ensures registry, Claude, and hooks all use the same ID
+        self.logger.info(f"Using session ID for Claude: {self.session_id}")
 
         # Build Claude Code command with explicit session ID
-        claude_cmd = [claude_bin, '--session-id', claude_session_uuid] + self.claude_args
+        claude_cmd = [claude_bin, '--session-id', self.session_id] + self.claude_args
 
         # Save terminal attributes to restore later (if available)
         try:
@@ -1044,21 +1047,8 @@ class HybridPTYWrapper:
                     if not self.thread_ts:
                         self.logger.warning("Timeout waiting for Slack thread creation")
 
-                # Use the Claude session ID we explicitly set with --session-id
-                # This ensures we register the correct session, not some other active session
-                if hasattr(self, 'claude_session_uuid'):
-                    self.logger.info(f"Using known Claude session ID: {self.claude_session_uuid}")
-                    self.register_claude_session(self.claude_session_uuid)
-                else:
-                    # Fallback to detection if for some reason we don't have the UUID
-                    self.logger.warning("No explicit Claude session UUID, attempting detection...")
-                    claude_session_id = self.detect_claude_session_id(timeout=10)
-                    if claude_session_id:
-                        self.register_claude_session(claude_session_id)
-                    else:
-                        self.logger.warning("Could not detect Claude session ID - hooks may not work correctly")
-                        print(f"{YELLOW}[Session {self.session_id}] Warning: Could not detect Claude session ID{RESET}", file=sys.stderr)
-                        print(f"{YELLOW}[Session {self.session_id}] Stop hooks may not work correctly{RESET}", file=sys.stderr)
+                # Session ID is the same for registry and Claude (full UUID), so no
+                # separate registration needed - hooks will find the session directly.
 
                 # Only do I/O loop if we have a terminal
                 if has_terminal:

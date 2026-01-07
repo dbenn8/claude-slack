@@ -105,22 +105,61 @@ SLACK_APP_TOKEN=xapp-your-app-token-here
 SLACK_CHANNEL=#your-channel-name
 ```
 
-### 4. Add to PATH (optional but recommended)
+Then run the installer:
+```bash
+./install.sh
+```
+
+The installer will:
+- Create a Python virtual environment
+- Install dependencies
+- Set up launchd services (auto-start on login)
+- Configure Claude Code hook settings
+- Add commands to your PATH
+
+### Uninstalling
+
+To remove the integration:
+```bash
+./uninstall.sh
+```
+
+### 4. Add to PATH (only if installing manually)
+
+If you used `install.sh`, PATH is already configured for you. Skip to step 5.
+
+<details>
+<summary>Manual PATH setup</summary>
 
 ```bash
 echo 'export PATH="$HOME/.claude/claude-slack/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
+</details>
 
-### 5. Test the Installation
+### 5. Verify Installation
+
+If you used `install.sh`, services are already running. Verify with:
+
+```bash
+# Check services are running
+launchctl list | grep claude-slack
+
+# Test Slack connection
+claude-slack-test
+```
+
+<details>
+<summary>Manual start (if not using install.sh)</summary>
 
 ```bash
 # Start the Slack listener
 claude-slack-listener
 
-# In another terminal, test sending a message
-claude-slack-test
+# In another terminal, start the registry
+claude-slack-registry
 ```
+</details>
 
 ## Usage
 
@@ -130,27 +169,76 @@ claude-slack-test
 # Navigate to your project
 cd /path/to/your/project
 
-# Initialize Slack integration for this project
+# Start Claude with Slack integration
 claude-slack
 
-# You should receive a new message in the slack channel you added to your .env file
-# You can reply 'as a thread' to the message to communicate with the claude session that sent the initial message
-# If your reply doesn't automatically get a green checkmark emoji applied to it, you need to @mention your claud bot to wake it back up and try your message again.
-# Claude code should receive your message as terminal input, generate it's response, and send it back to slack automatically.  You can continue the conversation as needed.
-
+# Or resume your last session
+claude-slack resume
 ```
 
+If you used `install.sh`, you can also use `claudes` as a shorthand alias:
+
+```bash
+claudes          # same as claude-slack
+claudes resume   # same as claude-slack resume
+```
+
+You should receive a new message in the Slack channel you added to your .env file. You can reply "as a thread" to the message to communicate with the Claude session that sent the initial message. If your reply doesn't automatically get a green checkmark emoji applied to it, you need to @mention your Claude bot to wake it back up and try your message again. Claude Code should receive your message as terminal input, generate its response, and send it back to Slack automatically. You can continue the conversation as needed.
 
 ## Available Commands
 
 After adding `~/.claude/claude-slack/bin` to your PATH:
 
 - `claude-slack` - Initialize Slack for current project
+- `claude-slack-hybrid` - Start Claude with PTY wrapper (supports `!restart`)
 - `claude-slack-listener` - Start the Slack listener daemon
+- `claude-slack-registry` - Start the session registry service
+- `claude-slack-ensure` - Ensure listener and registry are running
 - `claude-slack-test` - Test Slack connection
-- `claude-slack-ensure` - Ensure listener is running
 - `claude-slack-sessions` - List active sessions
 - `claude-slack-cleanup` - Clean up stale sessions
+- `claude-slack-health` - Check listener health
+
+## Slack Commands
+
+From within a session's Slack thread, you can send these commands:
+
+| Command | Shortcut | Description |
+|---------|----------|-------------|
+| `!slack on` | `!on` | Enable Slack mirroring for session |
+| `!slack off` | `!off` | Disable Slack mirroring |
+| `!slack status` | `!status` | Check current mirroring status |
+| `!restart` | - | Kill and restart the same Claude session |
+
+The `!restart` command requires using `claude-slack-hybrid` to start your session.
+
+## Background Services (launchd)
+
+**If you used `install.sh`**, launchd services are already configured and running. The listener and registry start automatically on login.
+
+### Managing Services
+
+```bash
+# Check status
+launchctl list | grep claude-slack
+
+# View logs
+tail -f ~/.claude/slack/logs/launchd_stdout.log
+
+# Stop services
+launchctl unload ~/Library/LaunchAgents/com.claude-slack.listener.plist
+launchctl unload ~/Library/LaunchAgents/com.claude-slack.registry.plist
+
+# Start services
+launchctl load ~/Library/LaunchAgents/com.claude-slack.listener.plist
+launchctl load ~/Library/LaunchAgents/com.claude-slack.registry.plist
+```
+
+<details>
+<summary>Manual setup (if not using install.sh)</summary>
+
+See the plist templates in `templates/` directory. Copy them to `~/Library/LaunchAgents/`, replace `{{HOME}}` and `{{VENV_PYTHON}}` with your paths, then load with `launchctl load`.
+</details>
 
 ## Troubleshooting
 
@@ -174,14 +262,15 @@ If you still experience issues, ensure your Slack app has all the scopes and eve
 ### Checking Logs
 
 ```bash
-# Check listener logs
-tail -f /tmp/slack_listener.log
+# Check listener logs (if using install.sh/launchd)
+tail -f ~/.claude/slack/logs/launchd_stdout.log
 
 # Check hook execution logs
 tail -f /tmp/stop_hook_debug.log
+tail -f /tmp/pretooluse_hook_debug.log
 
 # Check session registry
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
+sqlite3 ~/.claude/slack/registry.db "SELECT * FROM sessions;"
 ```
 
 ### Common Issues
@@ -206,23 +295,29 @@ sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
 
 ```
 ~/.claude/claude-slack/
-├── core/                 # Core Python modules
-│   ├── slack_listener.py      # Main Slack event listener
-│   ├── session_registry.py    # Session management
-│   ├── claude_wrapper_multi.py # Multi-session Claude wrapper
-│   ├── transcript_parser.py   # Parse Claude transcripts
-│   └── config.py              # Configuration management
-├── hooks/                # Claude Code hook templates
-│   ├── on_pretooluse.py      # Permission requests with full context (NEW!)
-│   ├── on_stop.py            # Response completion hook
-│   ├── on_notification.py    # User notification hook
+├── core/                       # Core Python modules
+│   ├── slack_listener.py       # Main Slack event listener
+│   ├── session_registry.py     # Session management service
+│   ├── registry_db.py          # SQLite session database
+│   ├── claude_wrapper_hybrid.py # PTY wrapper for bidirectional Slack
+│   ├── transcript_parser.py    # Parse Claude transcripts
+│   └── config.py               # Configuration management
+├── hooks/                      # Claude Code hook templates
+│   ├── on_pretooluse.py        # Standby messages + permission prompts
+│   ├── on_stop.py              # Response completion → Slack
+│   ├── on_notification.py      # User notifications → Slack
 │   └── settings.local.json.template
-├── bin/                  # Executable scripts
-│   ├── claude-slack          # Project initialization
-│   ├── claude-slack-listener # Start listener daemon
-│   └── ...
-├── .env.example          # Environment template
-└── README.md            # This file
+├── bin/                        # Executable scripts
+│   ├── claude-slack            # Start session with Slack
+│   ├── claude-slack-listener   # Listener daemon
+│   ├── claude-slack-registry   # Registry service
+│   ├── claude-slack-toggle     # Toggle mirroring on/off
+│   └── ...                     # See Available Commands
+├── templates/                  # launchd plist templates
+├── install.sh                  # Automated installer
+├── uninstall.sh                # Clean uninstaller
+├── .env.example                # Environment template
+└── README.md
 ```
 
 ## Security
@@ -244,15 +339,15 @@ Contributions are welcome! Please:
 
 This integration uses three Claude Code hooks:
 
-### 1. **PreToolUse Hook** (on_pretooluse.py) - NEW! ✨
+### 1. **PreToolUse Hook** (on_pretooluse.py)
 - **Fires:** Before Claude executes any tool (Bash, Write, Edit, Read, etc.)
-- **Purpose:** Sends detailed permission requests to Slack with FULL context
+- **Purpose:**
+  - Sends "⏳ Working on it..." standby message on first tool call
+  - Sends detailed permission requests (AskUserQuestion) to Slack
 - **What you see:**
-  - Actual bash commands before execution
-  - File paths being written/edited/read
-  - Search patterns and parameters
-  - Everything Claude wants to do, before it happens
-- **Why it's important:** Allows you to make informed security decisions remotely
+  - Standby indicator during long operations
+  - Full question context when Claude asks for input
+- **Why it's important:** Keeps you informed during long tool chains
 
 ### 2. **Notification Hook** (on_notification.py)
 - **Fires:** When Claude sends generic notifications (idle prompts, auth messages)
@@ -277,9 +372,9 @@ MIT License - see LICENSE file for details
 
 ## Support
 
-- Report issues: [GitHub Issues](https://github.com/YOUR_USERNAME/claude-claude-slack/issues)
+- Report issues: [GitHub Issues](https://github.com/dbenn8/claude-slack/issues)
 - Slack API docs: https://api.slack.com
-- Claude Code docs: https://claude.ai
+- Claude Code docs: https://claude.ai/code
 
 ## Credits
 

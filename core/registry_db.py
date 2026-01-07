@@ -33,11 +33,14 @@ class SessionRecord(Base):
     project = Column(String(255), nullable=False)     # Project name
     terminal = Column(String(100), nullable=False)    # Terminal type
     socket_path = Column(String(512), nullable=False) # Unix socket path
+    project_dir = Column(String(512), nullable=True)  # Full project directory path
+    wrapper_pid = Column(String(20), nullable=True)   # Wrapper process PID (for restart)
 
     # Slack integration
     slack_thread_ts = Column(String(50), nullable=True)  # Thread timestamp
     slack_channel = Column(String(50), nullable=True)    # Channel ID
     slack_user_id = Column(String(50), nullable=True)    # User ID who initiated session
+    slack_enabled = Column(String(5), nullable=False, default='true')  # Toggle for Slack mirroring
 
     # Status tracking
     status = Column(String(20), nullable=False, default='active')  # active/idle/terminated
@@ -58,9 +61,12 @@ class SessionRecord(Base):
             'project': self.project,
             'terminal': self.terminal,
             'socket_path': self.socket_path,
+            'project_dir': self.project_dir,
+            'wrapper_pid': int(self.wrapper_pid) if self.wrapper_pid else None,
             'thread_ts': self.slack_thread_ts,
             'channel': self.slack_channel,
             'slack_user_id': self.slack_user_id,
+            'slack_enabled': self.slack_enabled == 'true',
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'last_activity': self.last_activity.isoformat() if self.last_activity else None,
@@ -150,9 +156,12 @@ class RegistryDatabase:
                 project=session_data.get('project', 'unknown'),
                 terminal=session_data.get('terminal', 'unknown'),
                 socket_path=session_data['socket_path'],
+                project_dir=session_data.get('project_dir'),
+                wrapper_pid=str(session_data.get('wrapper_pid')) if session_data.get('wrapper_pid') else None,
                 slack_thread_ts=session_data.get('thread_ts'),
                 slack_channel=session_data.get('channel'),
                 slack_user_id=session_data.get('slack_user_id'),
+                slack_enabled=session_data.get('slack_enabled', 'true'),
                 status='active',
                 created_at=datetime.now(),
                 last_activity=datetime.now()
@@ -170,12 +179,16 @@ class RegistryDatabase:
 
             # Update allowed fields
             for key, value in updates.items():
-                if key in ('slack_thread_ts', 'slack_channel', 'slack_user_id', 'status', 'last_activity'):
+                if key in ('slack_thread_ts', 'slack_channel', 'slack_user_id', 'slack_enabled', 'status', 'last_activity', 'project_dir', 'wrapper_pid'):
                     setattr(record, key, value)
 
             # Always update last_activity on any update
             record.last_activity = datetime.now()
             return True
+
+    def toggle_slack(self, session_id: str, enabled: bool) -> bool:
+        """Toggle Slack mirroring for a session"""
+        return self.update_session(session_id, {'slack_enabled': 'true' if enabled else 'false'})
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session record"""
@@ -186,11 +199,37 @@ class RegistryDatabase:
             session.delete(record)
             return True
 
-    def get_by_thread(self, thread_ts: str) -> dict:
-        """Get session by Slack thread timestamp"""
+    def get_by_thread(self, thread_ts: str, channel: str = None) -> dict:
+        """Get session by Slack thread timestamp and optionally channel"""
         with self.session_scope() as session:
-            record = session.query(SessionRecord).filter_by(slack_thread_ts=thread_ts).first()
+            query = session.query(SessionRecord).filter_by(slack_thread_ts=thread_ts)
+            if channel:
+                query = query.filter_by(slack_channel=channel)
+            record = query.first()
             return record.to_dict() if record else None
+
+    def get_active_session_by_thread(self, thread_ts: str, channel: str) -> dict:
+        """Get active session by Slack thread and channel"""
+        with self.session_scope() as session:
+            record = session.query(SessionRecord).filter_by(
+                slack_thread_ts=thread_ts,
+                slack_channel=channel,
+                status='active'
+            ).first()
+            return record.to_dict() if record else None
+
+    def get_latest_session_for_project(self, project_dir: str) -> dict:
+        """Get the most recent session for a project directory"""
+        with self.session_scope() as session:
+            record = session.query(SessionRecord).filter_by(
+                project_dir=project_dir,
+                status='active'
+            ).order_by(SessionRecord.created_at.desc()).first()
+            return record.to_dict() if record else None
+
+    def end_session(self, session_id: str) -> bool:
+        """Mark a session as ended"""
+        return self.update_session(session_id, {'status': 'ended'})
 
     def cleanup_old_sessions(self, older_than_hours: int = 24) -> int:
         """Delete sessions older than specified hours"""

@@ -119,7 +119,12 @@ MONITOR_LOG="/tmp/slack_listener.log"
 # NOTE: Removed 'nohup' - it was interfering with Socket Mode WebSocket connections
 # Using 'tee' to write to both startup log and monitor log (monitor watches /tmp/slack_listener.log)
 cd "$CORE_DIR"
-python3 -u slack_listener.py 2>&1 | tee "$MONITOR_LOG" > "$LISTENER_LOG" &
+VENV_PYTHON="${INTEGRATION_DIR}/.venv/bin/python3"
+if [ -x "$VENV_PYTHON" ]; then
+    "$VENV_PYTHON" -u slack_listener.py 2>&1 | tee "$MONITOR_LOG" > "$LISTENER_LOG" &
+else
+    python3 -u slack_listener.py 2>&1 | tee "$MONITOR_LOG" > "$LISTENER_LOG" &
+fi
 NEW_PID=$!
 
 log "Started slack_listener.py with PID $NEW_PID"
