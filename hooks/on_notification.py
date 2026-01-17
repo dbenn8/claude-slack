@@ -48,7 +48,7 @@ Architecture:
     5. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/notification_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/notification_hook_debug.log
     - Includes timestamps, session info, environment vars
     - Tracks hook lifecycle from entry to exit
 """
@@ -62,8 +62,12 @@ from datetime import datetime
 # Hook version (for auto-updates)
 HOOK_VERSION = "2.1.0"
 
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # Debug log file path
-DEBUG_LOG = "/tmp/notification_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "notification_hook_debug.log")
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -862,7 +866,7 @@ def enhance_notification_message(
 
             # FIRST: Try to get exact permission text from output buffer
             exact_options_from_buffer = None
-            buffer_file = f"/tmp/claude_output_{session_id}.txt"
+            buffer_file = os.path.join(LOG_DIR, f"claude_output_{session_id}.txt")
 
             if os.path.exists(buffer_file):
                 try:

@@ -15,8 +15,8 @@ Phase 3 Mode (registry-based routing, preferred):
     - Routes threaded messages to correct session socket
     - Supports multiple concurrent Claude sessions in different threads
 
-Phase 2 Mode (legacy hard-coded socket):
-    - Sends to Unix socket at /tmp/claude_slack.sock
+Phase 2 Mode (legacy socket):
+    - Sends to Unix socket at ~/.claude/slack/sockets/claude_slack.sock
     - Used for non-threaded messages as fallback
 
 Phase 1 Mode (file-based fallback):
@@ -29,7 +29,7 @@ Usage:
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
     SLACK_APP_TOKEN - App-Level Token for Socket Mode (required)
-    SLACK_SOCKET_PATH - Unix socket path (default: /tmp/claude_slack.sock)
+    SLACK_SOCKET_PATH - Unix socket path (default: ~/.claude/slack/sockets/claude_slack.sock)
 
 Registry Database:
     Location: ~/.claude/slack/registry.db (default, override via REGISTRY_DB_PATH)
@@ -54,7 +54,8 @@ load_dotenv(env_path)
 # Configuration - use centralized config for consistent paths
 PROJECT_DIR = Path(__file__).parent.parent
 RESPONSE_FILE = PROJECT_DIR / "slack_response.txt"
-SOCKET_PATH = os.environ.get("SLACK_SOCKET_PATH", "/tmp/claude_slack.sock")
+SOCKET_DIR = get_socket_dir()
+SOCKET_PATH = os.environ.get("SLACK_SOCKET_PATH", os.path.join(SOCKET_DIR, "claude_slack.sock"))
 REGISTRY_DB_PATH = get_registry_db_path()  # Uses ~/.claude/slack/registry.db by default
 
 # Initialize registry database - create directory and DB if needed

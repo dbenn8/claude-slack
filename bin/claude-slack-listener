@@ -111,13 +111,13 @@ echo -e "${BLUE}Starting slack_listener.py...${NC}"
 LISTENER_LOG="$SLACK_LOG_DIR/slack_listener.log"
 > "$LISTENER_LOG" 2>/dev/null || true
 
-# Monitor expects logs at /tmp/slack_listener.log (for event starvation detection)
-MONITOR_LOG="/tmp/slack_listener.log"
+# Monitor log (same directory as other logs)
+MONITOR_LOG="$SLACK_LOG_DIR/slack_listener_monitor.log"
 > "$MONITOR_LOG" 2>/dev/null || true
 
 # Start the listener in the background
 # NOTE: Removed 'nohup' - it was interfering with Socket Mode WebSocket connections
-# Using 'tee' to write to both startup log and monitor log (monitor watches /tmp/slack_listener.log)
+# Using 'tee' to write to both startup log and monitor log
 cd "$CORE_DIR"
 python3 -u slack_listener.py 2>&1 | tee "$MONITOR_LOG" > "$LISTENER_LOG" &
 NEW_PID=$!

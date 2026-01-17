@@ -23,6 +23,38 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Parse arguments
+SESSION_DESCRIPTION=""
+CLAUDE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--description)
+            SESSION_DESCRIPTION="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: claude-slack [OPTIONS] [CLAUDE_ARGS...]"
+            echo ""
+            echo "Launch Claude Code with Slack integration"
+            echo ""
+            echo "Options:"
+            echo "  -d, --description TEXT  Optional description for the Slack thread"
+            echo "  -h, --help              Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  claude-slack"
+            echo "  claude-slack -d \"Working on auth feature\""
+            echo "  claude-slack --description \"Bug fix for issue #123\""
+            exit 0
+            ;;
+        *)
+            CLAUDE_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
 # Step 1: Ensure listener is ready
 echo -e "${BLUE}Checking Slack integration...${NC}"
 if ! "${SCRIPT_DIR}/claude-slack-ensure"; then
@@ -144,8 +176,15 @@ sleep 2
 
 # Step 4: Launch Claude with the hybrid wrapper
 echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
+if [ -n "$SESSION_DESCRIPTION" ]; then
+    echo -e "${BLUE}Description: ${SESSION_DESCRIPTION}${NC}"
+fi
 echo ""
 
-# Pass all arguments through to the Python wrapper
+# Pass description and Claude args to the Python wrapper
 cd "$PROJECT_DIR"
-exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+if [ -n "$SESSION_DESCRIPTION" ]; then
+    exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" --description "$SESSION_DESCRIPTION" "${CLAUDE_ARGS[@]}"
+else
+    exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "${CLAUDE_ARGS[@]}"
+fi

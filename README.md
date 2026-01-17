@@ -175,13 +175,13 @@ If you still experience issues, ensure your Slack app has all the scopes and eve
 
 ```bash
 # Check listener logs
-tail -f /tmp/slack_listener.log
+tail -f ~/.claude/slack/logs/slack_listener.log
 
 # Check hook execution logs
-tail -f /tmp/stop_hook_debug.log
+tail -f ~/.claude/slack/logs/notification_hook_debug.log
 
 # Check session registry
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
+sqlite3 ~/.claude/slack/registry.db "SELECT * FROM sessions;"
 ```
 
 ### Common Issues

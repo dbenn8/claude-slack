@@ -374,7 +374,7 @@ class RegistryClient:
             debug_log(f"Registry communication error: {e}")
             return None
 
-    def register(self, project, terminal, socket_path):
+    def register(self, project, terminal, socket_path, description=None):
         """Register session with registry and create Slack thread"""
         data = {
             "session_id": self.session_id,
@@ -382,6 +382,8 @@ class RegistryClient:
             "terminal": terminal,
             "socket_path": socket_path
         }
+        if description:
+            data["description"] = description
 
         response = self._send_command("REGISTER", data)
 
@@ -399,10 +401,11 @@ class RegistryClient:
 class HybridPTYWrapper:
     """Hybrid PTY wrapper combining input control with hooks output"""
 
-    def __init__(self, session_id, project_dir, claude_args=None):
+    def __init__(self, session_id, project_dir, claude_args=None, description=None):
         self.session_id = session_id
         self.project_dir = project_dir
         self.claude_args = claude_args or []
+        self.description = description  # Optional description for Slack thread
 
         # Setup logging
         self.logger = setup_logging(session_id)
@@ -411,6 +414,8 @@ class HybridPTYWrapper:
         self.logger.info(f"Session ID: {session_id}")
         self.logger.info(f"Project directory: {project_dir}")
         self.logger.info(f"Claude args: {claude_args}")
+        if description:
+            self.logger.info(f"Description: {description}")
         self.logger.info(f"Python version: {sys.version}")
         self.logger.info(f"Working directory: {os.getcwd()}")
 
@@ -443,7 +448,7 @@ class HybridPTYWrapper:
         # Output buffer for capturing exact permission prompts (4KB ring buffer)
         # Increased from 1KB to 4KB to capture all 3 permission options
         self.output_buffer = deque(maxlen=4096)
-        self.buffer_file = f"/tmp/claude_output_{session_id}.txt"
+        self.buffer_file = os.path.join(LOG_DIR, f"claude_output_{session_id}.txt")
         self.buffer_lock = threading.Lock()
         self.logger.info(f"Output buffer initialized: {self.buffer_file}")
 
@@ -571,7 +576,8 @@ class HybridPTYWrapper:
         success = self.registry.register(
             project=os.path.basename(self.project_dir),
             terminal=terminal,
-            socket_path=self.socket_path
+            socket_path=self.socket_path,
+            description=self.description
         )
 
         if success:
@@ -868,7 +874,7 @@ class HybridPTYWrapper:
             claude_session_id: Claude's full UUID session ID
         """
         old_buffer_file = self.buffer_file
-        new_buffer_file = f"/tmp/claude_output_{claude_session_id}.txt"
+        new_buffer_file = os.path.join(LOG_DIR, f"claude_output_{claude_session_id}.txt")
 
         with self.buffer_lock:
             try:
@@ -1152,6 +1158,7 @@ def main():
     )
 
     parser.add_argument("--session-id", help="Unique session ID (auto-generated if not provided)")
+    parser.add_argument("--description", "-d", help="Optional description for the Slack thread")
     parser.add_argument("--help", "-h", action="store_true", help="Show help message")
 
     # Parse known args, remaining go to Claude
@@ -1172,7 +1179,8 @@ def main():
     wrapper = HybridPTYWrapper(
         session_id=session_id,
         project_dir=project_dir,
-        claude_args=claude_args
+        claude_args=claude_args,
+        description=args.description
     )
 
     # Run wrapper

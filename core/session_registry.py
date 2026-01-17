@@ -638,6 +638,9 @@ class SessionRegistry:
         if not self.slack_client:
             raise RuntimeError("Slack client not initialized")
 
+        # Get optional description
+        description = session_data.get('description') or session_data.get('user_label')
+
         # Create simple parent message in channel (no status tracking)
         blocks = [
             {
@@ -646,25 +649,42 @@ class SessionRegistry:
                     "type": "plain_text",
                     "text": f"🚀 {session_data.get('project', 'Unknown')}"
                 }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Session:* `{session_data['session_id'][:12]}...`"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
-                    }
-                ]
             }
         ]
 
+        # Add description if provided
+        if description:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"_{description}_"
+                }
+            })
+
+        # Add session metadata
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Session:* `{session_data['session_id'][:12]}...`"
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
+                }
+            ]
+        })
+
+        # Build text fallback
+        text_fallback = f"New Session: {session_data.get('project', 'Unknown')}"
+        if description:
+            text_fallback += f" - {description}"
+
         response = self.slack_client.chat_postMessage(
             channel=self.slack_channel,
-            text=f"New Session: {session_data.get('project', 'Unknown')}",
+            text=text_fallback,
             blocks=blocks
         )
 
