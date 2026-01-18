@@ -38,7 +38,7 @@ fi
 echo ""
 
 echo "4. Latest Wrapper Log"
-LOG_DIR="${HOME}/.local/share/claude-code-integration/logs"
+LOG_DIR="${SLACK_LOG_DIR:-$HOME/.claude/slack/logs}"
 LATEST_LOG=$(ls -t "$LOG_DIR"/wrapper_*.log 2>/dev/null | head -1)
 if [ -n "$LATEST_LOG" ]; then
     echo "  Log: $LATEST_LOG"
@@ -51,7 +51,7 @@ fi
 echo ""
 
 echo "5. Active Sessions"
-SOCKET_DIR="${HOME}/.local/share/claude-code-integration/sockets"
+SOCKET_DIR="${SLACK_SOCKET_DIR:-$HOME/.claude/slack/sockets}"
 if [ -d "$SOCKET_DIR" ]; then
     echo "  Sockets in $SOCKET_DIR:"
     ls -lh "$SOCKET_DIR"/*.sock 2>/dev/null || echo "  No active sessions"

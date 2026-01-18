@@ -48,7 +48,7 @@ Architecture:
     6. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/pretooluse_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/pretooluse_hook_debug.log
 """
 
 import sys
@@ -60,8 +60,12 @@ from datetime import datetime
 # Hook version for auto-update detection
 HOOK_VERSION = "1.1.0"
 
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # Debug log file path
-DEBUG_LOG = "/tmp/pretooluse_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "pretooluse_hook_debug.log")
 
 # Find claude-slack directory dynamically
 def find_claude_slack_dir():

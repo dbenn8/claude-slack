@@ -164,7 +164,16 @@ class SessionRegistry:
     def _log(self, message: str):
         """Log message with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[Registry {timestamp}] {message}", file=sys.stderr)
+        log_line = f"[Registry {timestamp}] {message}"
+        print(log_line, file=sys.stderr)
+        # Also write to file for debugging
+        log_file = os.path.expanduser("~/.claude/slack/logs/session_registry.log")
+        try:
+            with open(log_file, "a") as f:
+                f.write(log_line + "\n")
+                f.flush()
+        except Exception:
+            pass
 
     def register_session(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -210,6 +219,8 @@ class SessionRegistry:
             def create_thread_async():
                 try:
                     self._log(f"[Async] Creating Slack thread for {session_id}")
+                    self._log(f"[Async] session_data keys: {list(session_data.keys())}")
+                    self._log(f"[Async] custom_channel in session_data: {session_data.get('custom_channel')}")
                     thread_data = self._create_slack_thread(session_data)
 
                     # Update session with thread info (atomic database update)
@@ -332,6 +343,40 @@ class SessionRegistry:
         """
         return self.db.list_sessions(status)
 
+    def deactivate_session(self, session_id: str) -> bool:
+        """
+        Mark a session as inactive (called during cleanup).
+
+        Unlike unregister_session, this preserves the session record for
+        history/debugging but marks it as no longer active.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            True if session was deactivated, False if not found
+        """
+        session = self.db.get_session(session_id)
+        if not session:
+            self._log(f"Session not found for deactivation: {session_id}")
+            return False
+
+        # Mark as inactive
+        self.db.update_session(session_id, {'status': 'inactive'})
+        self._log(f"Session {session_id} marked as inactive")
+
+        # Post a closing message to Slack thread if available
+        if self.slack_client and session.get("thread_ts") and session.get("channel"):
+            try:
+                self.slack_client.chat_postMessage(
+                    channel=session.get("channel"),
+                    thread_ts=session.get("thread_ts"),
+                    text="🔚 Session ended"
+                )
+            except Exception as e:
+                self._log(f"Failed to post session end message: {e}")
+
+        return True
 
     def get_by_thread(self, thread_ts: str) -> Optional[Dict[str, Any]]:
         """
@@ -575,28 +620,30 @@ class SessionRegistry:
                 return {"success": True, "session": session}
 
             elif command == "REGISTER_EXISTING":
-                # Register a new session ID pointing to an existing Slack thread
-                # Used to register Claude's UUID with the same thread as the wrapper
+                # Register a new session ID pointing to an existing Slack channel/thread
+                # Used to register Claude's UUID with the same Slack metadata as the wrapper
                 self._log(f"Processing REGISTER_EXISTING command for {data.get('session_id', 'unknown')}")
                 session_id = data.get("session_id")
-                thread_ts = data.get("thread_ts")
+                thread_ts = data.get("thread_ts")  # May be None for custom channel mode
                 channel = data.get("channel")
 
-                if not session_id or not thread_ts or not channel:
-                    return {"success": False, "error": "Missing required fields: session_id, thread_ts, channel"}
+                # Only require session_id and channel (thread_ts can be None for custom channels)
+                if not session_id or not channel:
+                    return {"success": False, "error": "Missing required fields: session_id, channel"}
 
                 # Create session with existing Slack metadata
                 session_data = {
                     'session_id': session_id,
                     'project': data.get("project", "Unknown"),
+                    'project_dir': data.get("project_dir"),
                     'terminal': data.get("terminal", "Unknown"),
                     'socket_path': data.get("socket_path", ""),
-                    'thread_ts': thread_ts,  # Note: create_session expects 'thread_ts' not 'slack_thread_ts'
-                    'channel': channel,       # Note: create_session expects 'channel' not 'slack_channel'
+                    'thread_ts': thread_ts,  # May be None for custom channel mode
+                    'channel': channel,
                     'slack_user_id': data.get("slack_user_id")
                 }
                 session = self.db.create_session(session_data)
-                self._log(f"REGISTER_EXISTING completed for {session_id} -> thread {thread_ts}")
+                self._log(f"REGISTER_EXISTING completed for {session_id} -> channel {channel}, thread {thread_ts}")
                 return {"success": True, "session": session}
 
             elif command == "UNREGISTER":
@@ -632,11 +679,48 @@ class SessionRegistry:
         """
         Create Slack thread for new session (simplified for hooks-based system)
 
+        For custom channels: No parent thread - messages go as top-level posts
+        For default channel: Creates a parent thread message
+
+        Args:
+            session_data: Session data dict, may include:
+                - custom_channel: Override channel for this session (uses top-level messages)
+                - permissions_channel: Separate channel for permission prompts
+                - description/user_label: Optional description for thread
+
         Returns:
-            {"thread_ts": "...", "channel": "..."}
+            {"slack_thread_ts": "...", "slack_channel": "...", "permissions_channel": "..."}
         """
         if not self.slack_client:
             raise RuntimeError("Slack client not initialized")
+
+        # Determine which channel to use (custom_channel overrides default)
+        custom_channel = session_data.get('custom_channel')
+        target_channel = custom_channel or self.slack_channel
+        permissions_channel = session_data.get('permissions_channel')
+
+        # Normalize channel names (strip # prefix if present)
+        if target_channel.startswith('#'):
+            target_channel = target_channel[1:]
+        if permissions_channel and permissions_channel.startswith('#'):
+            permissions_channel = permissions_channel[1:]
+
+        self._log(f"Creating Slack thread in channel: {target_channel}")
+        if permissions_channel:
+            self._log(f"Permissions channel: {permissions_channel}")
+
+        # For custom channels, use top-level messages (no parent thread)
+        if custom_channel:
+            self._log(f"Custom channel mode: using top-level messages (no thread)")
+            # Just return the channel info, no thread_ts
+            return {
+                "slack_thread_ts": None,  # No threading for custom channels
+                "slack_channel": target_channel,
+                "permissions_channel": permissions_channel
+            }
+
+        # Get optional description
+        description = session_data.get('description') or session_data.get('user_label')
 
         # Create simple parent message in channel (no status tracking)
         blocks = [
@@ -646,31 +730,49 @@ class SessionRegistry:
                     "type": "plain_text",
                     "text": f"🚀 {session_data.get('project', 'Unknown')}"
                 }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Session:* `{session_data['session_id'][:12]}...`"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
-                    }
-                ]
             }
         ]
 
+        # Add description if provided
+        if description:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"_{description}_"
+                }
+            })
+
+        # Add session metadata
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Session:* `{session_data['session_id'][:12]}...`"
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
+                }
+            ]
+        })
+
+        # Build text fallback
+        text_fallback = f"New Session: {session_data.get('project', 'Unknown')}"
+        if description:
+            text_fallback += f" - {description}"
+
         response = self.slack_client.chat_postMessage(
-            channel=self.slack_channel,
-            text=f"New Session: {session_data.get('project', 'Unknown')}",
+            channel=target_channel,
+            text=text_fallback,
             blocks=blocks
         )
 
         return {
             "slack_thread_ts": response["ts"],
-            "slack_channel": response["channel"]
+            "slack_channel": response["channel"],
+            "permissions_channel": permissions_channel
         }
 
     def _archive_slack_thread(self, session: Dict[str, Any]):

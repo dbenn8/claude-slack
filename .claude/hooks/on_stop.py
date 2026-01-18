@@ -2,6 +2,12 @@
 """
 Claude Code Stop Hook - Post Assistant Responses to Slack
 
+Version: 1.1.0
+
+Changelog:
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
+
 Triggered when Claude finishes processing a user prompt.
 Reads the transcript, extracts the latest assistant response, and posts it to Slack.
 
@@ -14,7 +20,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -30,7 +36,7 @@ Architecture:
     5. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/stop_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/stop_hook_debug.log
     - Includes timestamps, session info, environment vars
     - Tracks hook lifecycle from entry to exit
 """
@@ -41,8 +47,15 @@ import os
 from pathlib import Path
 from datetime import datetime
 
+# Hook version for auto-update detection
+HOOK_VERSION = "1.1.0"
+
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # Debug log file path
-DEBUG_LOG = "/tmp/stop_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "stop_hook_debug.log")
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -241,6 +254,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         chunks = chunks[:5]
 
     # Post each chunk
+    failed_chunks = []
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -258,11 +272,17 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
         except SlackApiError as e:
-            log_error(f"Slack API error: {e.response['error']}")
-            return False
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
         except Exception as e:
-            log_error(f"Error posting to Slack: {e}")
-            return False
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
 
     return True
 
@@ -359,8 +379,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):

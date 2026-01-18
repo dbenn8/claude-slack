@@ -29,14 +29,18 @@ class SessionRecord(Base):
     __tablename__ = 'sessions'
 
     # Session identification
-    session_id = Column(String(8), primary_key=True)  # 8-char hex ID
-    project = Column(String(255), nullable=False)     # Project name
-    terminal = Column(String(100), nullable=False)    # Terminal type
-    socket_path = Column(String(512), nullable=False) # Unix socket path
+    # NOTE: Expanded from String(8) to String(50) to support Claude's full UUID session IDs
+    # Wrapper uses 8-char IDs, Claude's internal project sessions use 36-char UUIDs
+    session_id = Column(String(50), primary_key=True)  # 8-char hex ID or 36-char UUID
+    project = Column(String(255), nullable=False)      # Project name
+    project_dir = Column(String(512), nullable=True)   # Full project directory path
+    terminal = Column(String(100), nullable=False)     # Terminal type
+    socket_path = Column(String(512), nullable=False)  # Unix socket path
 
     # Slack integration
-    slack_thread_ts = Column(String(50), nullable=True)  # Thread timestamp
+    slack_thread_ts = Column(String(50), nullable=True)  # Thread timestamp (None for custom channel mode)
     slack_channel = Column(String(50), nullable=True)    # Channel ID
+    permissions_channel = Column(String(50), nullable=True)  # Separate channel for permissions
     slack_user_id = Column(String(50), nullable=True)    # User ID who initiated session
 
     # Status tracking
@@ -49,6 +53,7 @@ class SessionRecord(Base):
         Index('idx_status', 'status'),
         Index('idx_last_activity', 'last_activity'),
         Index('idx_slack_thread', 'slack_thread_ts'),
+        Index('idx_project_dir', 'project_dir'),
     )
 
     def to_dict(self):
@@ -56,10 +61,12 @@ class SessionRecord(Base):
         return {
             'session_id': self.session_id,
             'project': self.project,
+            'project_dir': self.project_dir,
             'terminal': self.terminal,
             'socket_path': self.socket_path,
             'thread_ts': self.slack_thread_ts,
             'channel': self.slack_channel,
+            'permissions_channel': self.permissions_channel,
             'slack_user_id': self.slack_user_id,
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
@@ -104,8 +111,34 @@ class RegistryDatabase:
         # Create tables
         Base.metadata.create_all(self.engine)
 
+        # Run migrations for existing databases
+        self._run_migrations()
+
         # Session factory
         self.SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False)
+
+    def _run_migrations(self):
+        """
+        Apply database migrations for schema changes.
+
+        Migrations are idempotent - safe to run multiple times.
+        """
+        with self.engine.connect() as conn:
+            # Check existing columns
+            result = conn.execute(text("PRAGMA table_info(sessions)"))
+            columns = [row[1] for row in result.fetchall()]
+
+            # Add project_dir column if not exists
+            if 'project_dir' not in columns:
+                print(f"[Migration] Adding project_dir column to sessions table", flush=True)
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN project_dir VARCHAR(512)"))
+                conn.commit()
+
+            # Add permissions_channel column if not exists
+            if 'permissions_channel' not in columns:
+                print(f"[Migration] Adding permissions_channel column to sessions table", flush=True)
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN permissions_channel VARCHAR(50)"))
+                conn.commit()
 
     @contextmanager
     def session_scope(self):
@@ -148,10 +181,12 @@ class RegistryDatabase:
             record = SessionRecord(
                 session_id=session_data['session_id'],
                 project=session_data.get('project', 'unknown'),
+                project_dir=session_data.get('project_dir'),
                 terminal=session_data.get('terminal', 'unknown'),
                 socket_path=session_data['socket_path'],
                 slack_thread_ts=session_data.get('thread_ts'),
                 slack_channel=session_data.get('channel'),
+                permissions_channel=session_data.get('permissions_channel'),
                 slack_user_id=session_data.get('slack_user_id'),
                 status='active',
                 created_at=datetime.now(),
@@ -170,7 +205,7 @@ class RegistryDatabase:
 
             # Update allowed fields
             for key, value in updates.items():
-                if key in ('slack_thread_ts', 'slack_channel', 'slack_user_id', 'status', 'last_activity'):
+                if key in ('slack_thread_ts', 'slack_channel', 'permissions_channel', 'slack_user_id', 'status', 'last_activity', 'project_dir'):
                     setattr(record, key, value)
 
             # Always update last_activity on any update
@@ -190,6 +225,27 @@ class RegistryDatabase:
         """Get session by Slack thread timestamp"""
         with self.session_scope() as session:
             record = session.query(SessionRecord).filter_by(slack_thread_ts=thread_ts).first()
+            return record.to_dict() if record else None
+
+    def get_by_project_dir(self, project_dir: str, status: str = 'active') -> dict:
+        """
+        Get the most recent session for a project directory.
+
+        This is used as a fallback when session_id lookup fails - hooks can
+        look up the session by project_dir instead.
+
+        Args:
+            project_dir: Full path to the project directory
+            status: Filter by status (default: 'active')
+
+        Returns:
+            Most recent session for this project_dir, or None if not found
+        """
+        with self.session_scope() as session:
+            record = session.query(SessionRecord).filter_by(
+                project_dir=project_dir,
+                status=status
+            ).order_by(SessionRecord.created_at.desc()).first()
             return record.to_dict() if record else None
 
     def cleanup_old_sessions(self, older_than_hours: int = 24) -> int:

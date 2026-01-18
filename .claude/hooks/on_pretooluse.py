@@ -2,6 +2,12 @@
 """
 Claude Code PreToolUse Hook - Capture AskUserQuestion calls to Slack
 
+Version: 1.1.0
+
+Changelog:
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
+
 Triggered before Claude executes any tool, allowing us to capture AskUserQuestion
 calls with their full question text and options, which are not available in the
 Notification hook.
@@ -31,7 +37,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Architecture:
     1. Read hook data from stdin
@@ -42,7 +48,7 @@ Architecture:
     6. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/pretooluse_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/pretooluse_hook_debug.log
 """
 
 import sys
@@ -51,8 +57,15 @@ import os
 from pathlib import Path
 from datetime import datetime
 
+# Hook version for auto-update detection
+HOOK_VERSION = "1.1.0"
+
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # Debug log file path
-DEBUG_LOG = "/tmp/pretooluse_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "pretooluse_hook_debug.log")
 
 # Find claude-slack directory dynamically
 def find_claude_slack_dir():
@@ -213,8 +226,49 @@ def format_askuserquestion_for_slack(tool_input: dict) -> str:
     return "\n".join(lines)
 
 
+def split_message(text: str, max_length: int = 39000) -> list:
+    """
+    Split long message into chunks that fit in Slack's 40K char limit.
+
+    Args:
+        text: Message text to split
+        max_length: Max chars per chunk (default: 39000, leaves room for part indicators)
+
+    Returns:
+        List of text chunks
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    while text:
+        # Find a good breaking point (newline near max_length)
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        # Look for newline near the max length
+        break_point = text.rfind('\n', max_length - 500, max_length)
+        if break_point == -1:
+            # No newline found, just split at max_length
+            break_point = max_length
+
+        chunks.append(text[:break_point])
+        text = text[break_point:].lstrip('\n')
+
+    return chunks
+
+
 def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
-    """Post message to Slack thread."""
+    """
+    Post message to Slack thread, handling long messages.
+
+    Args:
+        channel: Slack channel ID
+        thread_ts: Thread timestamp
+        text: Message text
+        bot_token: Slack bot token
+    """
     try:
         from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
@@ -224,21 +278,46 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
 
     client = WebClient(token=bot_token)
 
-    try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=text
-        )
-        log_info("Posted to Slack")
-        return True
+    # Split message if too long
+    chunks = split_message(text)
 
-    except SlackApiError as e:
-        log_error(f"Slack API error: {e.response['error']}")
+    if len(chunks) > 5:
+        # Too many chunks, truncate
+        log_info(f"Message too long ({len(chunks)} chunks), truncating to 5 chunks")
+        chunks = chunks[:5]
+
+    # Post each chunk
+    failed_chunks = []
+    for i, chunk in enumerate(chunks):
+        try:
+            # Add part indicator for multi-part messages
+            if len(chunks) > 1:
+                message_text = f"{chunk}\n\n_(Part {i+1}/{len(chunks)})_"
+            else:
+                message_text = chunk
+
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=message_text
+            )
+
+            log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
+
+        except SlackApiError as e:
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
+        except Exception as e:
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
         return False
-    except Exception as e:
-        log_error(f"Error posting to Slack: {e}")
-        return False
+
+    return True
 
 
 def main():
@@ -286,8 +365,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):

@@ -2,9 +2,10 @@
 """
 Claude Code Notification Hook - Post Notifications to Slack
 
-Version: 2.1.0
+Version: 2.2.0
 
 Changelog:
+- v2.2.0 (2026/01/17): Added custom channel mode support (top-level messages, no threads)
 - v2.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
 - v2.0.0 (2025/11/17): Added permission text mapping based on real prompts
 
@@ -48,7 +49,7 @@ Architecture:
     5. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/notification_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/notification_hook_debug.log
     - Includes timestamps, session info, environment vars
     - Tracks hook lifecycle from entry to exit
 """
@@ -60,10 +61,14 @@ from pathlib import Path
 from datetime import datetime
 
 # Hook version (for auto-updates)
-HOOK_VERSION = "2.1.0"
+HOOK_VERSION = "2.2.0"
+
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
 
 # Debug log file path
-DEBUG_LOG = "/tmp/notification_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "notification_hook_debug.log")
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -837,7 +842,7 @@ def enhance_notification_message(
     notification_type: str,
     transcript_path: str,
     session_id: str
-) -> str:
+) -> tuple:
     """
     Enhance notification message with additional context from transcript.
 
@@ -848,9 +853,11 @@ def enhance_notification_message(
         session_id: Claude session ID
 
     Returns:
-        Enhanced message with formatting and context
+        Tuple of (enhanced_message, permission_options) where permission_options
+        is a list of option strings for permission prompts, or None for other types
     """
     enhanced = message
+    permission_options = None  # Will be populated for permission prompts
 
     try:
         # Import transcript parser
@@ -862,7 +869,7 @@ def enhance_notification_message(
 
             # FIRST: Try to get exact permission text from output buffer
             exact_options_from_buffer = None
-            buffer_file = f"/tmp/claude_output_{session_id}.txt"
+            buffer_file = os.path.join(LOG_DIR, f"claude_output_{session_id}.txt")
 
             if os.path.exists(buffer_file):
                 try:
@@ -964,12 +971,20 @@ def enhance_notification_message(
                     else:
                         debug_log(f"Using hardcoded mapping options ({len(options_to_use)} options)", "ENHANCE")
 
+                    # Store permission options for interactive buttons
+                    permission_options = options_to_use
+
                     enhanced += "\n**Reply with:**\n"
                     for i, option in enumerate(options_to_use, 1):
                         enhanced += f"{i}. {option}\n"
                 else:
                     debug_log("WARNING: No exact options found - using fallback", "ENHANCE")
                     # This shouldn't happen since get_exact_permission_options has fallback
+                    permission_options = [
+                        "Approve this time",
+                        "Approve commands like this for this project",
+                        "Deny, tell Claude what to do instead"
+                    ]
                     enhanced += "\n**Reply with:**\n"
                     enhanced += "1. Approve this time\n"
                     enhanced += "2. Approve commands like this for this project\n"
@@ -977,6 +992,11 @@ def enhance_notification_message(
             else:
                 # Fallback if retry parsing timed out or failed
                 debug_log("Retry parse FAILED/TIMEOUT - using simple fallback", "ENHANCE")
+                permission_options = [
+                    "Approve this time",
+                    "Approve commands like this for this project",
+                    "Deny, tell Claude what to do instead"
+                ]
                 enhanced = f"⚠️ {message}\n\n**Reply with:**\n1. Approve this time\n2. Approve commands like this for this project\n3. Deny, tell Claude what to do instead"
 
         # For idle prompts, include context about what Claude last said
@@ -1004,19 +1024,22 @@ def enhance_notification_message(
         debug_log(f"Failed to enhance notification: {e}", "ERROR")
         enhanced = message
 
-    return enhanced
+    return (enhanced, permission_options)
 
 
-def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_number_reactions: bool = False):
+def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_number_reactions: bool = False,
+                   use_interactive_buttons: bool = False, permission_options: list = None):
     """
-    Post message to Slack thread, handling long messages.
+    Post message to Slack channel or thread, handling long messages.
 
     Args:
         channel: Slack channel ID
-        thread_ts: Thread timestamp
+        thread_ts: Thread timestamp (None for top-level messages in custom channel mode)
         text: Message text
         bot_token: Slack bot token
-        add_number_reactions: If True, add 1️⃣ 2️⃣ 3️⃣ reactions for quick responses
+        add_number_reactions: If True, add 1️⃣ 2️⃣ 3️⃣ reactions for quick responses (legacy)
+        use_interactive_buttons: If True, use Block Kit buttons instead of reactions
+        permission_options: List of permission option strings for button labels
     """
     try:
         from slack_sdk import WebClient
@@ -1026,6 +1049,11 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_n
         return False
 
     client = WebClient(token=bot_token)
+
+    # For permission prompts with interactive buttons, use Block Kit
+    if use_interactive_buttons and permission_options:
+        debug_log("Using interactive Block Kit buttons for permission prompt", "SLACK")
+        return post_permission_card(client, channel, thread_ts, text, permission_options)
 
     # Split message if too long
     chunks = split_message(text)
@@ -1047,11 +1075,15 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_n
             else:
                 message_text = chunk
 
-            response = client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=message_text
-            )
+            # Only include thread_ts if provided (omit for top-level messages)
+            post_kwargs = {
+                "channel": channel,
+                "text": message_text
+            }
+            if thread_ts:
+                post_kwargs["thread_ts"] = thread_ts
+
+            response = client.chat_postMessage(**post_kwargs)
 
             # Save the message timestamp for adding reactions
             last_message_ts = response.get("ts")
@@ -1068,6 +1100,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_n
             continue
 
     # Add number emoji reactions for quick responses (on last message only)
+    # This is the fallback if interactive buttons aren't used
     if add_number_reactions and last_message_ts:
         import time
         debug_log("Adding number emoji reactions for quick response", "SLACK")
@@ -1095,6 +1128,146 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str, add_n
     return True
 
 
+def post_permission_card(client, channel: str, thread_ts: str, text: str, permission_options: list):
+    """
+    Post a Block Kit card with interactive buttons for permission prompts.
+
+    The card displays the permission request with clickable buttons that send
+    the numeric response (1, 2, 3) to Claude when clicked.
+
+    Args:
+        client: Slack WebClient instance
+        channel: Slack channel ID
+        thread_ts: Thread timestamp
+        text: Permission message text (will be parsed for tool info)
+        permission_options: List of permission option strings
+
+    Returns:
+        True if posted successfully, False otherwise
+    """
+    try:
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        log_error("slack_sdk not installed")
+        return False
+
+    debug_log(f"Building permission card with {len(permission_options)} options", "SLACK")
+
+    # Parse text to extract tool info and context
+    # Format expected: "⚠️ **Permission Required: ToolName**\n\n**Command:** `...`\n..."
+    lines = text.split('\n')
+    header_line = lines[0] if lines else "Permission Required"
+
+    # Extract tool name from header
+    import re
+    tool_match = re.search(r'Permission Required:\s*(\w+)', header_line)
+    tool_name = tool_match.group(1) if tool_match else "Tool"
+
+    # Build context sections
+    context_lines = []
+    for line in lines[1:]:
+        line = line.strip()
+        if line and not line.startswith('**Reply with:**') and not re.match(r'^\d+\.', line):
+            context_lines.append(line)
+
+    # Build Block Kit blocks
+    blocks = [
+        # Header
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"⚠️ Permission Required: {tool_name}",
+                "emoji": True
+            }
+        }
+    ]
+
+    # Add context as a section (limit to first few meaningful lines)
+    context_text = '\n'.join(context_lines[:4])
+    if context_text:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": context_text
+            }
+        })
+
+    blocks.append({"type": "divider"})
+
+    # Build action buttons
+    # Each button sends its number as the value, which will be forwarded to Claude
+    button_elements = []
+    button_styles = ["primary", None, "danger"]  # Green, Gray, Red
+
+    for i, option in enumerate(permission_options[:3], 1):
+        # Truncate long option text for button label
+        # Slack button text limit is 75 chars, we use "X. " prefix (3 chars) so max 72 for label
+        max_label_len = 69  # 75 - 3 (prefix) - 3 (ellipsis)
+        label = option[:max_label_len] + "..." if len(option) > max_label_len else option
+
+        button = {
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": f"{i}. {label}",
+                "emoji": True
+            },
+            "action_id": f"permission_response_{i}",
+            "value": str(i)  # This value will be sent to Claude
+        }
+
+        # Add style for first (approve) and third (deny) buttons
+        if i == 1:
+            button["style"] = "primary"  # Green
+        elif i == 3 or (i == 2 and len(permission_options) == 2):
+            button["style"] = "danger"   # Red
+
+        button_elements.append(button)
+
+    # Add buttons as actions block
+    blocks.append({
+        "type": "actions",
+        "block_id": "permission_actions",
+        "elements": button_elements
+    })
+
+    # Add footer with instructions
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": "💡 _Click a button or reply with 1, 2, or 3_"
+            }
+        ]
+    })
+
+    try:
+        # Only include thread_ts if provided (omit for top-level messages)
+        post_kwargs = {
+            "channel": channel,
+            "text": f"Permission Required: {tool_name}",  # Fallback text
+            "blocks": blocks
+        }
+        if thread_ts:
+            post_kwargs["thread_ts"] = thread_ts
+
+        response = client.chat_postMessage(**post_kwargs)
+        debug_log(f"Permission card posted successfully: {response.get('ts')}", "SLACK")
+        log_info("Posted permission card to Slack")
+        return True
+
+    except SlackApiError as e:
+        log_error(f"Slack API error posting permission card: {e.response['error']}")
+        debug_log(f"Full error: {e}", "SLACK")
+        return False
+    except Exception as e:
+        log_error(f"Error posting permission card: {e}")
+        return False
+
+
 def main():
     """Main hook entry point"""
     debug_log("Entering main()", "LIFECYCLE")
@@ -1113,6 +1286,7 @@ def main():
         notification_message = hook_data.get("message")
         notification_type = hook_data.get("notification_type", "unknown")
         transcript_path = hook_data.get("transcript_path")
+        project_dir = hook_data.get("project_dir")  # Full path to project directory
 
         # Infer notification_type from message content if not provided
         if notification_type == "unknown" and notification_message:
@@ -1127,6 +1301,7 @@ def main():
         debug_log(f"notification_message: {notification_message}", "INPUT")
         debug_log(f"notification_type: {notification_type}", "INPUT")
         debug_log(f"transcript_path: {transcript_path}", "INPUT")
+        debug_log(f"project_dir: {project_dir}", "INPUT")
 
         if not session_id:
             log_error("No session_id in hook data")
@@ -1158,64 +1333,82 @@ def main():
 
         debug_log("Opening registry database...", "REGISTRY")
         db = RegistryDatabase(db_path)
-        debug_log(f"Querying session: {session_id}", "REGISTRY")
+
+        # Try to find session by session_id first
+        debug_log(f"Querying session by session_id: {session_id}", "REGISTRY")
         session = db.get_session(session_id)
-        debug_log(f"Session found: {session is not None}", "REGISTRY")
+        debug_log(f"Session found by session_id: {session is not None}", "REGISTRY")
+
+        # FALLBACK: If session not found by ID, try project_dir lookup
+        if not session and project_dir:
+            debug_log(f"Session not found by ID, trying project_dir: {project_dir}", "REGISTRY")
+            session = db.get_by_project_dir(project_dir, status='active')
+            debug_log(f"Session found by project_dir: {session is not None}", "REGISTRY")
+
+            if session:
+                log_info(f"Found session by project_dir: {session.get('session_id', 'unknown')[:8]}")
 
         if not session:
-            log_error(f"Session {session_id[:8]} not found in registry")
+            log_error(f"Session {session_id[:8]} not found in registry (tried session_id and project_dir)")
             sys.exit(0)
 
         # Extract Slack metadata
         slack_channel = session.get("channel")
-        slack_thread_ts = session.get("thread_ts")
+        slack_thread_ts = session.get("thread_ts")  # May be None for custom channel mode
+        permissions_channel = session.get("permissions_channel")  # Separate channel for permissions
+
         debug_log(f"Slack channel: {slack_channel}", "SLACK")
         debug_log(f"Slack thread_ts: {slack_thread_ts}", "SLACK")
+        debug_log(f"Permissions channel: {permissions_channel}", "SLACK")
 
-        # SELF-HEALING: If session exists but Slack metadata is missing
-        if not slack_channel or not slack_thread_ts:
-            log_info(f"Session {session_id[:8]} missing Slack metadata, attempting self-heal...")
+        # Determine which channel to use for this notification
+        is_permission_prompt = notification_type == "permission_prompt"
+        if is_permission_prompt and permissions_channel:
+            # Use dedicated permissions channel
+            target_channel = permissions_channel
+            target_thread_ts = None  # Permissions channel uses top-level messages
+            debug_log(f"Using permissions channel: {target_channel}", "SLACK")
+        else:
+            target_channel = slack_channel
+            target_thread_ts = slack_thread_ts
+            debug_log(f"Using main channel: {target_channel}, thread_ts: {target_thread_ts}", "SLACK")
+
+        # SELF-HEALING: If session exists but Slack channel is missing
+        # Note: thread_ts can be None for custom channel mode (top-level messages)
+        if not target_channel:
+            log_info(f"Session {session_id[:8]} missing Slack channel, attempting self-heal...")
             debug_log("Attempting self-healing for missing Slack metadata", "REGISTRY")
 
-            # Look for a shorter session ID (wrapper session) with matching project
-            # Wrapper session IDs are 8 chars, Claude UUIDs are 36 chars (with dashes)
-            if len(session_id) > 8:
-                # Extract first 8 chars as potential wrapper ID
-                wrapper_session_id = session_id[:8]
-                debug_log(f"Looking for wrapper session: {wrapper_session_id}", "REGISTRY")
-                wrapper_session = db.get_session(wrapper_session_id)
+            # Strategy: Look for any active session with matching project_dir that has Slack metadata
+            if project_dir:
+                debug_log(f"Looking for session with project_dir and Slack metadata: {project_dir}", "REGISTRY")
+                matching_session = db.get_by_project_dir(project_dir, status='active')
 
-                if wrapper_session and wrapper_session.get("thread_ts") and wrapper_session.get("channel"):
-                    log_info(f"Found wrapper session {wrapper_session_id} with metadata, copying...")
-                    debug_log(f"Wrapper has thread_ts={wrapper_session.get('thread_ts')}, channel={wrapper_session.get('channel')}", "REGISTRY")
+                if matching_session and matching_session.get("channel"):
+                    log_info(f"Found matching session with Slack metadata: {matching_session.get('session_id', 'unknown')[:8]}")
+                    debug_log(f"Found thread_ts={matching_session.get('thread_ts')}, channel={matching_session.get('channel')}", "REGISTRY")
 
-                    # Copy metadata to Claude session
-                    db.update_session(session_id, {
-                        'slack_thread_ts': wrapper_session.get("thread_ts"),
-                        'slack_channel': wrapper_session.get("channel")
-                    })
+                    # Use the found session's Slack metadata
+                    target_channel = matching_session.get("channel")
+                    if not (is_permission_prompt and permissions_channel):
+                        target_thread_ts = matching_session.get("thread_ts")
 
-                    # Re-query to get updated session
-                    session = db.get_session(session_id)
-                    slack_channel = session.get("channel")
-                    slack_thread_ts = session.get("thread_ts")
-
-                    log_info(f"Self-healed: thread_ts={slack_thread_ts}, channel={slack_channel}")
-                    debug_log("Self-healing successful", "REGISTRY")
+                    log_info(f"Self-healed via project_dir: channel={target_channel}, thread_ts={target_thread_ts}")
+                    debug_log("Self-healing successful via project_dir lookup", "REGISTRY")
                 else:
-                    log_error(f"Self-healing failed: no wrapper session found or it also missing metadata")
-                    debug_log("Self-healing failed: no suitable wrapper session", "REGISTRY")
+                    log_error(f"Self-healing failed: no session with Slack metadata found for project_dir")
+                    debug_log("Self-healing failed: no suitable session found", "REGISTRY")
                     sys.exit(0)
             else:
-                log_error(f"Session {session_id[:8]} missing Slack metadata and self-healing not applicable (wrapper session)")
+                log_error(f"Session {session_id[:8]} missing Slack metadata and no project_dir for self-healing")
                 sys.exit(0)
 
-        # Final check after self-healing attempt
-        if not slack_channel or not slack_thread_ts:
-            log_error(f"Session {session_id[:8]} missing Slack metadata after self-healing (channel={slack_channel}, thread_ts={slack_thread_ts})")
+        # Final check - need at least a channel
+        if not target_channel:
+            log_error(f"Session {session_id[:8]} missing Slack channel after self-healing")
             sys.exit(0)
 
-        log_info(f"Found Slack thread: {slack_channel} / {slack_thread_ts}")
+        log_info(f"Using Slack channel: {target_channel}, thread_ts: {target_thread_ts}")
 
         # Get Slack bot token
         bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -1226,19 +1419,27 @@ def main():
         debug_log("Bot token found, enhancing notification message...", "SLACK")
 
         # Enhance notification message with context
-        enhanced_message = enhance_notification_message(
+        enhanced_message, permission_options = enhance_notification_message(
             notification_message,
             notification_type,
             transcript_path,
             session_id
         )
         debug_log(f"Enhanced message (first 200 chars): {enhanced_message[:200]}", "SLACK")
+        if permission_options:
+            debug_log(f"Permission options: {permission_options}", "SLACK")
 
         # Post notification to Slack
-        # Add number emoji reactions for permission prompts (enables quick tap responses)
-        is_permission_prompt = notification_type == "permission_prompt"
-        success = post_to_slack(slack_channel, slack_thread_ts, enhanced_message, bot_token,
-                               add_number_reactions=is_permission_prompt)
+        # For permission prompts, use interactive buttons (Block Kit cards)
+        success = post_to_slack(
+            target_channel,
+            target_thread_ts,  # May be None for top-level messages
+            enhanced_message,
+            bot_token,
+            add_number_reactions=False,  # Replaced by interactive buttons
+            use_interactive_buttons=is_permission_prompt,
+            permission_options=permission_options
+        )
 
         if success:
             log_info("Successfully posted to Slack")

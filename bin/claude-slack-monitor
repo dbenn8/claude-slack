@@ -12,9 +12,21 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CORE_DIR="$INTEGRATION_DIR/core"
 
-# Environment variables (use /tmp for compatibility with original)
-LOG_FILE="/tmp/slack_listener.log"
-MONITOR_LOG="/tmp/slack_monitor.log"
+# Load environment variables from .env file
+ENV_FILE="$INTEGRATION_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+fi
+
+# Log directory (defaults to ~/.claude/slack/logs)
+SLACK_LOG_DIR=${SLACK_LOG_DIR:-"$HOME/.claude/slack/logs"}
+mkdir -p "$SLACK_LOG_DIR"
+
+# Log files
+LOG_FILE="$SLACK_LOG_DIR/slack_listener_monitor.log"
+MONITOR_LOG="$SLACK_LOG_DIR/slack_monitor.log"
 CHECK_INTERVAL=180  # Check every 3 minutes
 EVENT_TIMEOUT=300   # Restart if no events for 5 minutes
 

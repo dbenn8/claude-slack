@@ -374,14 +374,21 @@ class RegistryClient:
             debug_log(f"Registry communication error: {e}")
             return None
 
-    def register(self, project, terminal, socket_path):
+    def register(self, project, terminal, socket_path, project_dir=None, description=None, custom_channel=None, permissions_channel=None):
         """Register session with registry and create Slack thread"""
         data = {
             "session_id": self.session_id,
             "project": project,
+            "project_dir": project_dir,
             "terminal": terminal,
             "socket_path": socket_path
         }
+        if description:
+            data["description"] = description
+        if custom_channel:
+            data["custom_channel"] = custom_channel  # Override default channel (top-level messages)
+        if permissions_channel:
+            data["permissions_channel"] = permissions_channel  # Separate channel for permissions
 
         response = self._send_command("REGISTER", data)
 
@@ -399,10 +406,13 @@ class RegistryClient:
 class HybridPTYWrapper:
     """Hybrid PTY wrapper combining input control with hooks output"""
 
-    def __init__(self, session_id, project_dir, claude_args=None):
+    def __init__(self, session_id, project_dir, claude_args=None, description=None, channel=None, permissions_channel=None):
         self.session_id = session_id
         self.project_dir = project_dir
         self.claude_args = claude_args or []
+        self.description = description  # Optional description for Slack thread
+        self.custom_channel = channel   # Optional channel override (uses top-level messages)
+        self.permissions_channel = permissions_channel  # Separate channel for permissions
 
         # Setup logging
         self.logger = setup_logging(session_id)
@@ -411,6 +421,12 @@ class HybridPTYWrapper:
         self.logger.info(f"Session ID: {session_id}")
         self.logger.info(f"Project directory: {project_dir}")
         self.logger.info(f"Claude args: {claude_args}")
+        if description:
+            self.logger.info(f"Description: {description}")
+        if channel:
+            self.logger.info(f"Custom channel: {channel} (top-level messages)")
+        if permissions_channel:
+            self.logger.info(f"Permissions channel: {permissions_channel}")
         self.logger.info(f"Python version: {sys.version}")
         self.logger.info(f"Working directory: {os.getcwd()}")
 
@@ -443,7 +459,7 @@ class HybridPTYWrapper:
         # Output buffer for capturing exact permission prompts (4KB ring buffer)
         # Increased from 1KB to 4KB to capture all 3 permission options
         self.output_buffer = deque(maxlen=4096)
-        self.buffer_file = f"/tmp/claude_output_{session_id}.txt"
+        self.buffer_file = os.path.join(LOG_DIR, f"claude_output_{session_id}.txt")
         self.buffer_lock = threading.Lock()
         self.logger.info(f"Output buffer initialized: {self.buffer_file}")
 
@@ -570,8 +586,12 @@ class HybridPTYWrapper:
         self.logger.info(f"Sending REGISTER command to registry (will create Slack thread)")
         success = self.registry.register(
             project=os.path.basename(self.project_dir),
+            project_dir=self.project_dir,
             terminal=terminal,
-            socket_path=self.socket_path
+            socket_path=self.socket_path,
+            description=self.description,
+            custom_channel=self.custom_channel,
+            permissions_channel=self.permissions_channel
         )
 
         if success:
@@ -599,8 +619,9 @@ class HybridPTYWrapper:
         self.logger.info(f"Attempting to register Claude session ID: {claude_session_id}")
         self.logger.debug(f"Registry available: {self.registry.available}, thread_ts: {self.thread_ts}, channel: {self.channel}")
 
-        if not self.registry.available or not self.thread_ts:
-            self.logger.warning(f"Cannot register Claude session - registry: {self.registry.available}, thread_ts: {self.thread_ts}")
+        # Need at least a channel to register (thread_ts can be None for custom channel mode)
+        if not self.registry.available or not self.channel:
+            self.logger.warning(f"Cannot register Claude session - registry: {self.registry.available}, channel: {self.channel}")
             return False
 
         self.logger.info(f"Registering Claude session ID: {claude_session_id}")
@@ -621,6 +642,7 @@ class HybridPTYWrapper:
                 "data": {
                     "session_id": claude_session_id,
                     "project": os.path.basename(self.project_dir),
+                    "project_dir": self.project_dir,
                     "terminal": os.environ.get("TERM_PROGRAM", "Unknown"),
                     "socket_path": self.socket_path,
                     "thread_ts": self.thread_ts,
@@ -868,7 +890,7 @@ class HybridPTYWrapper:
             claude_session_id: Claude's full UUID session ID
         """
         old_buffer_file = self.buffer_file
-        new_buffer_file = f"/tmp/claude_output_{claude_session_id}.txt"
+        new_buffer_file = os.path.join(LOG_DIR, f"claude_output_{claude_session_id}.txt")
 
         with self.buffer_lock:
             try:
@@ -898,6 +920,18 @@ class HybridPTYWrapper:
         """Clean up resources"""
         self.logger.info("Starting cleanup")
         self.running = False
+
+        # Mark session as inactive in registry
+        if self.registry and self.registry.available:
+            try:
+                self.registry.deactivate_session(self.session_id)
+                self.logger.info(f"Session {self.session_id} marked as inactive")
+                # Also deactivate Claude's session if registered
+                if hasattr(self, 'claude_session_uuid') and self.claude_session_uuid:
+                    self.registry.deactivate_session(self.claude_session_uuid)
+                    self.logger.info(f"Claude session {self.claude_session_uuid[:8]} marked as inactive")
+            except Exception as e:
+                self.logger.error(f"Error deactivating session: {e}")
 
         # Close socket
         if self.socket:
@@ -1009,17 +1043,18 @@ class HybridPTYWrapper:
             else:  # Parent process
                 self.logger.info(f"PTY forked successfully - PID: {pid}, master_fd: {self.master_fd}")
 
-                # Wait for async Slack thread creation to complete
+                # Wait for async Slack thread/channel setup to complete
                 # The REGISTER command creates the thread asynchronously, so we need to
-                # wait for thread_ts and channel to be populated in the database
-                if self.registry.available and not self.thread_ts:
-                    self.logger.info("Waiting for async Slack thread creation...")
+                # wait for channel to be populated in the database
+                # Note: thread_ts may be None for custom channel mode (top-level messages)
+                if self.registry.available and not self.channel:
+                    self.logger.info("Waiting for async Slack channel setup...")
                     max_wait = 10  # seconds
                     start_time = time.time()
 
                     while time.time() - start_time < max_wait:
                         try:
-                            # Query the database directly to check if thread was created
+                            # Query the database directly to check if channel was set
                             import sqlite3
                             db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
                             conn = sqlite3.connect(db_path)
@@ -1031,18 +1066,22 @@ class HybridPTYWrapper:
                             row = cursor.fetchone()
                             conn.close()
 
-                            if row and row[0] and row[1]:
-                                self.thread_ts = row[0]
+                            # Only require channel to be set (thread_ts can be None for custom channels)
+                            if row and row[1]:
+                                self.thread_ts = row[0]  # May be None for custom channel mode
                                 self.channel = row[1]
-                                self.logger.info(f"Slack thread created: {self.thread_ts} in {self.channel}")
+                                if self.thread_ts:
+                                    self.logger.info(f"Slack thread created: {self.thread_ts} in {self.channel}")
+                                else:
+                                    self.logger.info(f"Slack channel set (top-level mode): {self.channel}")
                                 break
                         except Exception as e:
-                            self.logger.debug(f"Error checking thread status: {e}")
+                            self.logger.debug(f"Error checking channel status: {e}")
 
                         time.sleep(0.5)
 
-                    if not self.thread_ts:
-                        self.logger.warning("Timeout waiting for Slack thread creation")
+                    if not self.channel:
+                        self.logger.warning("Timeout waiting for Slack channel setup")
 
                 # Use the Claude session ID we explicitly set with --session-id
                 # This ensures we register the correct session, not some other active session
@@ -1152,6 +1191,9 @@ def main():
     )
 
     parser.add_argument("--session-id", help="Unique session ID (auto-generated if not provided)")
+    parser.add_argument("--description", "-d", help="Optional description for the Slack thread")
+    parser.add_argument("--channel", "-c", help="Slack channel for this session (overrides default)")
+    parser.add_argument("--permissions-channel", "-p", help="Separate channel for permission prompts")
     parser.add_argument("--help", "-h", action="store_true", help="Show help message")
 
     # Parse known args, remaining go to Claude
@@ -1172,7 +1214,10 @@ def main():
     wrapper = HybridPTYWrapper(
         session_id=session_id,
         project_dir=project_dir,
-        claude_args=claude_args
+        claude_args=claude_args,
+        description=args.description,
+        channel=args.channel,
+        permissions_channel=args.permissions_channel
     )
 
     # Run wrapper

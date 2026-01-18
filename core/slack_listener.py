@@ -15,8 +15,8 @@ Phase 3 Mode (registry-based routing, preferred):
     - Routes threaded messages to correct session socket
     - Supports multiple concurrent Claude sessions in different threads
 
-Phase 2 Mode (legacy hard-coded socket):
-    - Sends to Unix socket at /tmp/claude_slack.sock
+Phase 2 Mode (legacy socket):
+    - Sends to Unix socket at ~/.claude/slack/sockets/claude_slack.sock
     - Used for non-threaded messages as fallback
 
 Phase 1 Mode (file-based fallback):
@@ -29,7 +29,7 @@ Usage:
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
     SLACK_APP_TOKEN - App-Level Token for Socket Mode (required)
-    SLACK_SOCKET_PATH - Unix socket path (default: /tmp/claude_slack.sock)
+    SLACK_SOCKET_PATH - Unix socket path (default: ~/.claude/slack/sockets/claude_slack.sock)
 
 Registry Database:
     Location: ~/.claude/slack/registry.db (default, override via REGISTRY_DB_PATH)
@@ -54,7 +54,8 @@ load_dotenv(env_path)
 # Configuration - use centralized config for consistent paths
 PROJECT_DIR = Path(__file__).parent.parent
 RESPONSE_FILE = PROJECT_DIR / "slack_response.txt"
-SOCKET_PATH = os.environ.get("SLACK_SOCKET_PATH", "/tmp/claude_slack.sock")
+SOCKET_DIR = get_socket_dir()
+SOCKET_PATH = os.environ.get("SLACK_SOCKET_PATH", os.path.join(SOCKET_DIR, "claude_slack.sock"))
 REGISTRY_DB_PATH = get_registry_db_path()  # Uses ~/.claude/slack/registry.db by default
 
 # Initialize registry database - create directory and DB if needed
@@ -143,13 +144,93 @@ def get_socket_for_thread(thread_ts):
         return None
 
 
-def send_response(text, thread_ts=None):
+def get_socket_for_channel(channel):
+    """
+    Look up socket path for a custom channel session (where thread_ts is None).
+
+    This is used for custom channel mode where messages are posted as top-level
+    messages instead of in threads.
+
+    Args:
+        channel: Slack channel ID (e.g., "C1234567890") or channel name
+
+    Returns:
+        str: Socket path for the session, or None if not found
+
+    Note:
+        - Only matches sessions where thread_ts is NULL (custom channel mode)
+        - Prefers session with shortest session_id (8 chars = wrapper)
+        - Resolves channel ID to name for matching (DB stores names)
+    """
+    if not registry_db:
+        print(f"⚠️  No registry database - cannot lookup socket for channel {channel}", file=sys.stderr)
+        return None
+
+    try:
+        # Resolve channel ID to name if it looks like an ID (starts with C)
+        channel_name = channel
+        if channel and channel.startswith('C'):
+            try:
+                result = app.client.conversations_info(channel=channel)
+                if result.get("ok") and result.get("channel"):
+                    channel_name = result["channel"].get("name", channel)
+                    print(f"📋 Resolved channel ID {channel} to name: {channel_name}", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️  Could not resolve channel ID {channel}: {e}", file=sys.stderr)
+                # Continue with the ID as fallback
+
+        with registry_db.session_scope() as session:
+            from registry_db import SessionRecord
+            # Find sessions for this channel where thread_ts is NULL (custom channel mode)
+            # Try both channel ID and resolved name
+            records = session.query(SessionRecord).filter(
+                SessionRecord.slack_channel.in_([channel, channel_name]),
+                SessionRecord.slack_thread_ts.is_(None),
+                SessionRecord.status == 'active'
+            ).all()
+
+            if not records:
+                print(f"⚠️  No active custom channel session found for channel {channel} (name: {channel_name})", file=sys.stderr)
+                return None
+
+            # Prefer the wrapper session (8 chars) over Claude UUID (36 chars)
+            # BUT only if the socket file actually exists (filter out stale sessions)
+            wrapper_session = None
+            fallback_session = None
+
+            for record in records:
+                # Skip sessions whose socket doesn't exist (stale)
+                if not record.socket_path or not os.path.exists(record.socket_path):
+                    print(f"⚠️  Skipping stale session {record.session_id} - socket doesn't exist", file=sys.stderr)
+                    continue
+
+                if len(record.session_id) == 8:
+                    wrapper_session = record
+                    break
+                else:
+                    fallback_session = record
+
+            chosen = wrapper_session or fallback_session
+
+            if chosen and chosen.socket_path:
+                print(f"✅ Found socket for custom channel {channel}: {chosen.socket_path} (session {chosen.session_id})", file=sys.stderr)
+                return chosen.socket_path
+            else:
+                print(f"⚠️  No session with existing socket found for channel {channel}", file=sys.stderr)
+                return None
+
+    except Exception as e:
+        print(f"❌ Error querying registry for channel {channel}: {e}", file=sys.stderr)
+        return None
+
+
+def send_response(text, thread_ts=None, channel=None):
     """
     Send response to Claude Code
 
     Phase 3 Mode (registry-based, preferred):
-        If thread_ts provided, lookup socket from registry
-        Send to correct session socket for that thread
+        If thread_ts provided, lookup socket from registry by thread
+        If no thread_ts but channel provided, try custom channel lookup
 
     Phase 2 Mode (legacy hard-coded):
         Send to hard-coded socket path (backward compatible)
@@ -161,17 +242,27 @@ def send_response(text, thread_ts=None):
     Args:
         text: The response text to send
         thread_ts: Slack thread timestamp (for registry lookup)
+        channel: Slack channel ID (for custom channel mode lookup)
 
     Returns:
-        str: Mode used ("registry_socket", "socket", or "file")
+        str: Mode used ("registry_socket", "custom_channel_socket", "socket", or "file")
     """
     socket_path = None
+    routing_mode = None
 
-    # Phase 3: Try registry lookup first (if thread_ts provided)
+    # Phase 3a: Try registry lookup by thread_ts first
     if thread_ts:
         socket_path = get_socket_for_thread(thread_ts)
         if socket_path:
             print(f"📋 Using registry socket for thread {thread_ts}: {socket_path}", file=sys.stderr)
+            routing_mode = "registry_socket"
+
+    # Phase 3b: Try custom channel lookup (where thread_ts is NULL)
+    if not socket_path and channel:
+        socket_path = get_socket_for_channel(channel)
+        if socket_path:
+            print(f"📋 Using custom channel socket for channel {channel}: {socket_path}", file=sys.stderr)
+            routing_mode = "custom_channel_socket"
 
     # Phase 2: Fall back to hard-coded socket path
     if not socket_path:
@@ -191,7 +282,7 @@ def send_response(text, thread_ts=None):
                 client_socket.sendall(text.encode('utf-8'))
                 client_socket.close()
 
-                mode = "registry_socket" if thread_ts else "socket"
+                mode = routing_mode or "socket"
                 print(f"✅ Sent via {mode}: {text[:100]}", file=sys.stderr)
                 return mode
 
@@ -238,8 +329,8 @@ def handle_mention(event, say):
         say("👋 Hi! Send me a message and I'll forward it to Claude Code.")
         return
 
-    # Send response to Claude Code (registry socket, legacy socket, or file)
-    mode = send_response(clean_text, thread_ts=thread_ts)
+    # Send response to Claude Code (registry socket, custom channel socket, legacy socket, or file)
+    mode = send_response(clean_text, thread_ts=thread_ts, channel=channel)
 
     # Acknowledge with reaction
     try:
@@ -296,16 +387,26 @@ def handle_message(event, say):
     # This prevents responding to every message in every channel
     is_dm = channel_type == "im"
 
-    # For channel messages (not in threads), only process if the message starts with a command prefix
-    # For threaded messages, process all messages (they're replies to Claude)
-    if not is_dm and not thread_ts:
+    # For channel messages (not in threads), check if this is a custom channel session
+    # Custom channel mode: messages are top-level, not threaded
+    is_custom_channel = False
+    if not is_dm and not thread_ts and channel:
+        # Check if there's an active custom channel session for this channel
+        socket_path = get_socket_for_channel(channel)
+        if socket_path:
+            is_custom_channel = True
+            print(f"📋 Custom channel mode detected for {channel}", file=sys.stderr)
+
+    # For channel messages (not in threads and not custom channel), only process command-like messages
+    # For threaded messages and custom channels, process all messages (they're replies to Claude)
+    if not is_dm and not thread_ts and not is_custom_channel:
         # Skip messages that don't look like commands
         # Allow: /command, !command, or plain numbers (1, 2, 3)
         if not (text.startswith('/') or text.startswith('!') or text.isdigit()):
             return
 
-    # Send response to Claude Code (registry socket, legacy socket, or file)
-    mode = send_response(text, thread_ts=thread_ts)
+    # Send response to Claude Code (registry socket, custom channel socket, legacy socket, or file)
+    mode = send_response(text, thread_ts=thread_ts, channel=channel)
 
     # Acknowledge with reaction
     try:
@@ -399,8 +500,8 @@ def handle_reaction(body, client):
         # Fall back to message_ts
         thread_ts = message_ts
 
-    # Send the numeric response to Claude
-    mode = send_response(response, thread_ts=thread_ts)
+    # Send the numeric response to Claude (pass channel for custom channel mode fallback)
+    mode = send_response(response, thread_ts=thread_ts, channel=channel)
 
     # Log the reaction-to-input conversion
     print(f"📌 Reaction '{emoji_name}' from user {user} → sent '{response}' via {mode}", file=sys.stderr)
@@ -415,6 +516,140 @@ def handle_reaction(body, client):
         print(f"📌 Added confirmation checkmark", file=sys.stderr)
     except Exception as e:
         print(f"⚠️  Could not add confirmation reaction: {e}", file=sys.stderr)
+
+
+@app.action("permission_response_1")
+@app.action("permission_response_2")
+@app.action("permission_response_3")
+def handle_permission_button(ack, body, client):
+    """
+    Handle interactive button clicks for permission prompts.
+
+    When a user clicks a permission button (1, 2, or 3), this handler:
+    1. Acknowledges the button click immediately (required by Slack)
+    2. Extracts the button value (the numeric response)
+    3. Gets the thread_ts for routing to the correct Claude session
+    4. Sends the numeric response to Claude
+    5. Updates the message to show the selection
+
+    The button action_ids are: permission_response_1, permission_response_2, permission_response_3
+    The button values are: "1", "2", "3"
+    """
+    # Acknowledge immediately (Slack requires response within 3 seconds)
+    ack()
+
+    print(f"🔘 Button click event received", file=sys.stderr)
+
+    try:
+        # Extract action info
+        actions = body.get("actions", [])
+        if not actions:
+            print(f"⚠️  No actions in button click body", file=sys.stderr)
+            return
+
+        action = actions[0]
+        response = action.get("value")  # "1", "2", or "3"
+        action_id = action.get("action_id")
+        button_style = action.get("style")  # "primary", "danger", or None
+        user_id = body.get("user", {}).get("id")
+        user_name = body.get("user", {}).get("name", "Unknown")
+
+        # Check if this is the deny button (danger style = red button = "No")
+        # This handles both 2-option (button 2 = deny) and 3-option (button 3 = deny) prompts
+        is_deny_button = button_style == "danger"
+
+        print(f"🔘 Action: {action_id}, Value: {response}, Style: {button_style}, User: {user_name}", file=sys.stderr)
+
+        # Get message and thread info from the body
+        message = body.get("message", {})
+        channel = body.get("channel", {}).get("id")
+        message_ts = message.get("ts")
+        thread_ts = message.get("thread_ts", message_ts)  # Thread parent or message itself
+
+        print(f"🔘 Channel: {channel}, Thread: {thread_ts}", file=sys.stderr)
+
+        if not response:
+            print(f"⚠️  Missing response in button click", file=sys.stderr)
+            return
+
+        # Check if this is a custom channel session (no thread, but channel has active session)
+        is_custom_channel = False
+        if channel:
+            custom_socket = get_socket_for_channel(channel)
+            if custom_socket:
+                is_custom_channel = True
+                print(f"🔘 Custom channel mode detected for button click", file=sys.stderr)
+
+        # For "deny" option (danger-styled button), prompt user for feedback instead of sending immediately
+        # But for custom channels, just send the value since there's no thread to reply in
+        if is_deny_button and not is_custom_channel:
+            print(f"🔘 Deny button clicked - prompting for feedback", file=sys.stderr)
+            try:
+                # Update the message to prompt for feedback
+                client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"❌ *<@{user_id}> denied the request*\n\n💬 Please reply in this thread with instructions for Claude:"
+                            }
+                        }
+                    ],
+                    text="Permission denied - please reply with feedback"
+                )
+                print(f"🔘 Prompting user for feedback in thread", file=sys.stderr)
+                # Don't send response yet - wait for user's follow-up message
+                return
+            except Exception as e:
+                print(f"⚠️  Could not update message for feedback prompt: {e}", file=sys.stderr)
+                # Fall through to send response directly
+        elif is_deny_button and is_custom_channel:
+            print(f"🔘 Deny button clicked in custom channel - sending '{response}' directly (no thread for feedback)", file=sys.stderr)
+
+        # Send the numeric response to Claude (for approve options, or fallback for deny)
+        # Pass channel for custom channel mode fallback routing
+        mode = send_response(response, thread_ts=thread_ts, channel=channel)
+        print(f"🔘 Button '{response}' from {user_name} → sent via {mode}", file=sys.stderr)
+
+        # Delete the permission message to keep the channel clean
+        try:
+            client.chat_delete(
+                channel=channel,
+                ts=message_ts
+            )
+            print(f"🔘 Permission message deleted (keeping channel clean)", file=sys.stderr)
+
+        except Exception as e:
+            # If deletion fails (e.g., bot lacks permissions), fall back to updating the message
+            print(f"⚠️  Could not delete message, falling back to update: {e}", file=sys.stderr)
+            try:
+                # Update to show selection confirmation
+                client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"✅ *<@{user_id}> approved* (option {response})"
+                            }
+                        }
+                    ],
+                    text=f"Permission approved (option {response})"
+                )
+                print(f"🔘 Message updated to show approval (fallback)", file=sys.stderr)
+            except Exception as e2:
+                print(f"⚠️  Could not update message either: {e2}", file=sys.stderr)
+                # Don't fail - the response was already sent
+
+    except Exception as e:
+        print(f"❌ Error handling button click: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
 
 
 def main():
@@ -451,6 +686,8 @@ def main():
     print("   - Direct messages")
     print("   - Channel messages starting with / or !")
     print("   - Single digit responses (1, 2, 3)")
+    print("   - Emoji reactions (1️⃣ 2️⃣ 3️⃣ 👍 👎)")
+    print("   - Interactive button clicks")
     print("   - Threaded replies (routed to correct session)")
     print("")
     print("   Press Ctrl+C to stop")

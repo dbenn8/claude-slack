@@ -1,0 +1,332 @@
+#!/bin/bash
+
+# Claude-Slack Test Script
+# Tests Slack connection by sending a test message to the configured channel
+# With --local flag, tests the hooks configuration in the current directory
+
+set -e
+
+# Get the script directory and set paths
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(pwd)"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Parse arguments
+LOCAL_TEST=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -l|--local)
+            LOCAL_TEST=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: claude-slack-test [OPTIONS]"
+            echo ""
+            echo "Test Slack connection and optionally project hooks"
+            echo ""
+            echo "Options:"
+            echo "  -l, --local  Test hooks configuration in current directory"
+            echo "  -h, --help   Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  claude-slack-test          # Test global Slack connection"
+            echo "  claude-slack-test --local  # Test current directory hooks setup"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Load environment variables from .env file
+ENV_FILE="$INTEGRATION_DIR/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    echo -e "${RED}✗ Error: .env file not found at $ENV_FILE${NC}"
+    echo "  Please create the .env file with your Slack tokens"
+    echo "  Copy from .env.example and fill in your tokens"
+    exit 1
+fi
+
+set -a
+source "$ENV_FILE"
+set +a
+
+if [ "$LOCAL_TEST" = true ]; then
+    # =========================================
+    # LOCAL/DIRECTORY TEST MODE
+    # =========================================
+    echo "======================================="
+    echo "Claude-Slack Directory Test"
+    echo "======================================="
+    echo ""
+    echo -e "${BLUE}Testing: ${PROJECT_DIR}${NC}"
+    echo ""
+
+    ISSUES=0
+
+    # Test 1: Check for .claude directory
+    echo -n "1. Checking .claude directory... "
+    if [ -d "$PROJECT_DIR/.claude" ]; then
+        echo -e "${GREEN}✓ Found${NC}"
+    else
+        echo -e "${RED}✗ Not found${NC}"
+        ISSUES=$((ISSUES + 1))
+    fi
+
+    # Test 2: Check for hooks directory
+    echo -n "2. Checking .claude/hooks directory... "
+    if [ -d "$PROJECT_DIR/.claude/hooks" ]; then
+        echo -e "${GREEN}✓ Found${NC}"
+    else
+        echo -e "${RED}✗ Not found${NC}"
+        ISSUES=$((ISSUES + 1))
+    fi
+
+    # Test 3: Check for required hook files
+    echo "3. Checking hook files..."
+    HOOKS=("on_stop.py" "on_notification.py" "on_pretooluse.py")
+    for hook in "${HOOKS[@]}"; do
+        echo -n "   - $hook... "
+        if [ -f "$PROJECT_DIR/.claude/hooks/$hook" ]; then
+            # Check if executable
+            if [ -x "$PROJECT_DIR/.claude/hooks/$hook" ]; then
+                echo -e "${GREEN}✓ Found (executable)${NC}"
+            else
+                echo -e "${YELLOW}⚠ Found (not executable)${NC}"
+            fi
+        else
+            echo -e "${RED}✗ Not found${NC}"
+            ISSUES=$((ISSUES + 1))
+        fi
+    done
+
+    # Test 4: Check settings.local.json
+    echo -n "4. Checking settings.local.json... "
+    SETTINGS_FILE="$PROJECT_DIR/.claude/settings.local.json"
+    if [ -f "$SETTINGS_FILE" ]; then
+        echo -e "${GREEN}✓ Found${NC}"
+
+        # Check if hooks are configured
+        echo -n "   - Hooks configured... "
+        if grep -q '"hooks"' "$SETTINGS_FILE"; then
+            echo -e "${GREEN}✓ Yes${NC}"
+        else
+            echo -e "${RED}✗ No hooks section${NC}"
+            ISSUES=$((ISSUES + 1))
+        fi
+    else
+        echo -e "${RED}✗ Not found${NC}"
+        ISSUES=$((ISSUES + 1))
+    fi
+
+    # Test 5: Check if listener is running
+    echo -n "5. Checking Slack listener... "
+    if pgrep -f "slack_listener.py" > /dev/null; then
+        PID=$(pgrep -f "slack_listener.py" | head -1)
+        echo -e "${GREEN}✓ Running (PID: $PID)${NC}"
+    else
+        echo -e "${RED}✗ Not running${NC}"
+        ISSUES=$((ISSUES + 1))
+    fi
+
+    # Test 6: Send a test message from this directory
+    echo ""
+    echo -n "6. Sending test message from this directory... "
+
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+    TEST_MESSAGE="🧪 *Directory Test: ${PROJECT_NAME}*\n\nThis is a test from \`claude-slack-test --local\`.\n\n• Directory: \`${PROJECT_DIR}\`\n• Time: ${TIMESTAMP}\n• Hooks installed: ✅"
+
+    # Resolve channel
+    CHANNEL_ID="$SLACK_CHANNEL"
+    if [[ "$SLACK_CHANNEL" == \#* ]]; then
+        CHANNEL_NAME="${SLACK_CHANNEL:1}"
+        CHANNELS_RESPONSE=$(curl -s -X GET "https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200" \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN")
+        CHANNEL_ID=$(echo "$CHANNELS_RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for ch in data.get('channels', []):
+        if ch.get('name') == '$CHANNEL_NAME':
+            print(ch.get('id'))
+            break
+except:
+    pass
+" 2>/dev/null)
+    fi
+
+    if [ -n "$CHANNEL_ID" ]; then
+        SEND_RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"channel\": \"$CHANNEL_ID\",
+                \"text\": \"$TEST_MESSAGE\",
+                \"mrkdwn\": true
+            }")
+
+        SEND_OK=$(echo "$SEND_RESPONSE" | grep -o '"ok":[^,]*' | cut -d: -f2)
+        if [ "$SEND_OK" = "true" ]; then
+            echo -e "${GREEN}✓ Sent${NC}"
+        else
+            ERROR=$(echo "$SEND_RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+            echo -e "${RED}✗ Failed ($ERROR)${NC}"
+            ISSUES=$((ISSUES + 1))
+        fi
+    else
+        echo -e "${RED}✗ Channel not found${NC}"
+        ISSUES=$((ISSUES + 1))
+    fi
+
+    # Summary
+    echo ""
+    echo "======================================="
+    if [ $ISSUES -eq 0 ]; then
+        echo -e "${GREEN}✅ DIRECTORY READY FOR SLACK${NC}"
+        echo "======================================="
+        echo ""
+        echo "This directory is fully configured for Slack integration."
+        echo "Start a session with: claude-slack"
+    else
+        echo -e "${RED}✗ $ISSUES ISSUE(S) FOUND${NC}"
+        echo "======================================="
+        echo ""
+        echo "To fix, run from this directory:"
+        echo "  claude-slack"
+        echo ""
+        echo "This will install the required hooks and configuration."
+    fi
+
+else
+    # =========================================
+    # GLOBAL CONNECTION TEST MODE
+    # =========================================
+    echo "======================================="
+    echo "Claude-Slack Connection Test"
+    echo "======================================="
+    echo ""
+
+    # Validate required variables
+    echo -n "1. Checking SLACK_BOT_TOKEN... "
+    if [ -z "$SLACK_BOT_TOKEN" ]; then
+        echo -e "${RED}✗ Not set${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Set${NC}"
+
+    echo -n "2. Checking SLACK_CHANNEL... "
+    if [ -z "$SLACK_CHANNEL" ]; then
+        echo -e "${RED}✗ Not set${NC}"
+        echo "   Please set SLACK_CHANNEL in your .env file"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ $SLACK_CHANNEL${NC}"
+
+    # Test 1: Verify API connection with auth.test
+    echo ""
+    echo -n "3. Testing Slack API connection... "
+    AUTH_RESPONSE=$(curl -s -X POST "https://slack.com/api/auth.test" \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        -H "Content-Type: application/json")
+
+    AUTH_OK=$(echo "$AUTH_RESPONSE" | grep -o '"ok":[^,]*' | cut -d: -f2)
+    if [ "$AUTH_OK" = "true" ]; then
+        BOT_NAME=$(echo "$AUTH_RESPONSE" | grep -o '"user":"[^"]*"' | cut -d'"' -f4)
+        TEAM_NAME=$(echo "$AUTH_RESPONSE" | grep -o '"team":"[^"]*"' | cut -d'"' -f4)
+        echo -e "${GREEN}✓ Connected${NC}"
+        echo "   Bot: $BOT_NAME"
+        echo "   Team: $TEAM_NAME"
+    else
+        echo -e "${RED}✗ Failed${NC}"
+        ERROR=$(echo "$AUTH_RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+        echo "   Error: $ERROR"
+        exit 1
+    fi
+
+    # Test 2: Send a test message
+    echo ""
+    echo -n "4. Sending test message to $SLACK_CHANNEL... "
+
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    HOSTNAME=$(hostname)
+    TEST_MESSAGE="🧪 *Claude-Slack Test Message*\n\nThis is a test message from \`claude-slack-test\`.\n\n• Time: $TIMESTAMP\n• Host: $HOSTNAME\n• Status: ✅ Connection working!"
+
+    # Resolve channel name to ID if needed (channel names start with #)
+    CHANNEL_ID="$SLACK_CHANNEL"
+    if [[ "$SLACK_CHANNEL" == \#* ]]; then
+        # Remove the # prefix for the API
+        CHANNEL_NAME="${SLACK_CHANNEL:1}"
+
+        # List channels to find the ID
+        CHANNELS_RESPONSE=$(curl -s -X GET "https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200" \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN")
+
+        CHANNEL_ID=$(echo "$CHANNELS_RESPONSE" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for ch in data.get('channels', []):
+        if ch.get('name') == '$CHANNEL_NAME':
+            print(ch.get('id'))
+            break
+except:
+    pass
+" 2>/dev/null)
+
+        if [ -z "$CHANNEL_ID" ]; then
+            echo -e "${RED}✗ Channel not found${NC}"
+            echo "   Could not find channel: $SLACK_CHANNEL"
+            echo "   Make sure the bot is invited to the channel"
+            exit 1
+        fi
+    fi
+
+    # Send the message
+    SEND_RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"channel\": \"$CHANNEL_ID\",
+            \"text\": \"$TEST_MESSAGE\",
+            \"mrkdwn\": true
+        }")
+
+    SEND_OK=$(echo "$SEND_RESPONSE" | grep -o '"ok":[^,]*' | cut -d: -f2)
+    if [ "$SEND_OK" = "true" ]; then
+        echo -e "${GREEN}✓ Message sent!${NC}"
+        MESSAGE_TS=$(echo "$SEND_RESPONSE" | grep -o '"ts":"[^"]*"' | head -1 | cut -d'"' -f4)
+        echo "   Message timestamp: $MESSAGE_TS"
+    else
+        echo -e "${RED}✗ Failed to send${NC}"
+        ERROR=$(echo "$SEND_RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+        echo "   Error: $ERROR"
+
+        if [ "$ERROR" = "channel_not_found" ] || [ "$ERROR" = "not_in_channel" ]; then
+            echo ""
+            echo "   Tip: The bot needs to be invited to the channel."
+            echo "   In Slack, go to $SLACK_CHANNEL and type: /invite @$BOT_NAME"
+        fi
+        exit 1
+    fi
+
+    echo ""
+    echo "======================================="
+    echo -e "${GREEN}✅ ALL TESTS PASSED${NC}"
+    echo "======================================="
+    echo ""
+    echo "Your Slack connection is working correctly!"
+    echo "Check $SLACK_CHANNEL for the test message."
+    echo ""
+    echo "To test a specific directory, use: claude-slack-test --local"
+fi

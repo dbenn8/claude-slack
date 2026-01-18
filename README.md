@@ -140,6 +140,34 @@ claude-slack
 
 ```
 
+### Custom Channel Mode
+
+You can run Claude sessions in a dedicated channel with top-level messages instead of threads:
+
+```bash
+# Start a session that posts to a specific channel (no threads)
+claude-slack --channel testchannel
+
+# Or use the short form
+claude-slack -c testchannel
+```
+
+**Custom channel mode features:**
+- Messages are posted as top-level messages (not in threads)
+- Useful for dedicated project channels or testing
+- Permission prompts appear with interactive buttons
+- Responses are routed back via channel-based lookup
+
+**Note:** Only one active session per custom channel is supported. Previous sessions are automatically cleaned up.
+
+### Permissions Channel
+
+You can send permission prompts to a separate channel:
+
+```bash
+# Send permission prompts to a different channel
+claude-slack --permissions-channel security-approvals
+```
 
 ## Available Commands
 
@@ -175,13 +203,13 @@ If you still experience issues, ensure your Slack app has all the scopes and eve
 
 ```bash
 # Check listener logs
-tail -f /tmp/slack_listener.log
+tail -f ~/.claude/slack/logs/slack_listener.log
 
 # Check hook execution logs
-tail -f /tmp/stop_hook_debug.log
+tail -f ~/.claude/slack/logs/notification_hook_debug.log
 
 # Check session registry
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
+sqlite3 ~/.claude/slack/registry.db "SELECT * FROM sessions;"
 ```
 
 ### Common Issues
