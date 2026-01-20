@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+Test script to compare permission notification formats.
+
+Posts examples of:
+1. Standard Yes/No (2 options) - WITH buttons
+2. Standard Yes/Yes,allow.../No (3 options) - WITH buttons
+3. Custom 4 options - WITHOUT buttons (text only)
+4. Custom 3 options that don't match pattern - WITHOUT buttons
+
+Usage:
+    ./bin/test-permission-formats [channel]
+"""
+
+import os
+import sys
+import time
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
+sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "hooks"))
+
+from dotenv import load_dotenv
+
+# Load environment
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(env_path)
+
+
+def should_show_buttons(permission_options):
+    """Check if permission options should display as interactive buttons."""
+    if not permission_options:
+        return False
+
+    num_options = len(permission_options)
+
+    # Pattern 1: Simple Yes/No (2 options)
+    if num_options == 2:
+        opt1 = permission_options[0].lower().strip()
+        opt2 = permission_options[1].lower().strip()
+        if opt1 == "yes" and opt2.startswith("no"):
+            return True
+
+    # Pattern 2: Yes / Yes, allow... / No (3 options)
+    if num_options == 3:
+        opt1 = permission_options[0].lower().strip()
+        opt2 = permission_options[1].lower().strip()
+        opt3 = permission_options[2].lower().strip()
+        if (opt1 == "yes" and
+            opt2.startswith("yes, allow") and
+            opt3.startswith("no")):
+            return True
+
+    return False
+
+
+def post_with_buttons(client, channel, text, options):
+    """Post a message with Block Kit buttons."""
+    # Build Block Kit blocks
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text}
+        },
+        {"type": "divider"}
+    ]
+
+    # Build action buttons
+    button_elements = []
+    button_styles = ["primary", None, "danger"]
+
+    for i, option in enumerate(options):
+        label = option[:69] + "..." if len(option) > 72 else option
+        button = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"{i+1}. {label}", "emoji": True},
+            "action_id": f"test_response_{i+1}",
+            "value": str(i + 1)
+        }
+        if i == 0:
+            button["style"] = "primary"
+        elif i == len(options) - 1:
+            button["style"] = "danger"
+        button_elements.append(button)
+
+    blocks.append({
+        "type": "actions",
+        "block_id": "test_actions",
+        "elements": button_elements
+    })
+
+    return client.chat_postMessage(
+        channel=channel,
+        text=text,
+        blocks=blocks
+    )
+
+
+def post_text_only(client, channel, text, options):
+    """Post a message with text-only options (no buttons) and add number reactions."""
+    full_text = text + "\n\n**Reply with:**\n"
+    for i, option in enumerate(options, 1):
+        full_text += f"{i}. {option}\n"
+
+    response = client.chat_postMessage(
+        channel=channel,
+        text=full_text,
+        mrkdwn=True
+    )
+
+    # Add number reactions matching the number of options
+    # IMPORTANT: Use channel ID from response, not the channel name
+    number_emojis = ["one", "two", "three", "four", "five"]
+    message_ts = response.get("ts")
+    channel_id = response.get("channel")  # Get actual channel ID
+    if message_ts and channel_id:
+        for emoji in number_emojis[:len(options)]:
+            try:
+                client.reactions_add(
+                    channel=channel_id,  # Use channel ID, not name
+                    timestamp=message_ts,
+                    name=emoji
+                )
+                time.sleep(0.1)
+            except:
+                pass  # Ignore reaction errors in test
+
+    return response
+
+
+def main():
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        print("Error: slack_sdk not installed. Run: pip install slack-sdk")
+        sys.exit(1)
+
+    bot_token = os.environ.get("SLACK_BOT_TOKEN")
+    if not bot_token:
+        print("Error: SLACK_BOT_TOKEN not set in .env")
+        sys.exit(1)
+
+    channel = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SLACK_CHANNEL", "#claude-sessions")
+    client = WebClient(token=bot_token)
+
+    print(f"Posting test notifications to {channel}...\n")
+
+    # Test cases
+    test_cases = [
+        {
+            "name": "2-option Yes/No (BUTTONS)",
+            "text": "⚠️ **Permission Required: Bash**\n\n**Command:** `rm -rf /tmp/test`",
+            "options": ["Yes", "No, and tell Claude what to do differently"]
+        },
+        {
+            "name": "3-option Yes/Yes,allow.../No (BUTTONS)",
+            "text": "⚠️ **Permission Required: Write**\n\n**File:** `/src/config.py`",
+            "options": [
+                "Yes",
+                "Yes, allow all edits in /src/ during this session",
+                "No, and tell Claude what to do differently"
+            ]
+        },
+        {
+            "name": "4-option custom (NO BUTTONS)",
+            "text": "❓ **Question: AskUserQuestion**\n\nWhich database should we use?",
+            "options": [
+                "PostgreSQL - Complex queries, ACID compliance",
+                "MongoDB - Flexible schema, documents",
+                "SQLite - Simple, single-user",
+                "Redis - In-memory, caching"
+            ]
+        },
+        {
+            "name": "3-option custom (NO BUTTONS)",
+            "text": "❓ **Question: AskUserQuestion**\n\nHow should we proceed?",
+            "options": [
+                "Continue with current approach",
+                "Try alternative method",
+                "Cancel and explain why"
+            ]
+        }
+    ]
+
+    for case in test_cases:
+        options = case["options"]
+        use_buttons = should_show_buttons(options)
+
+        print(f"📤 {case['name']}")
+        print(f"   Options: {len(options)}")
+        print(f"   Buttons: {'Yes' if use_buttons else 'No'}")
+
+        try:
+            if use_buttons:
+                response = post_with_buttons(client, channel, case["text"], options)
+            else:
+                response = post_text_only(client, channel, case["text"], options)
+
+            print(f"   ✅ Posted (ts: {response['ts']})")
+        except SlackApiError as e:
+            print(f"   ❌ Error: {e.response['error']}")
+
+        time.sleep(1)  # Small delay between posts
+        print()
+
+    print("Done! Check your Slack channel to see the different formats.")
+
+
+if __name__ == "__main__":
+    main()

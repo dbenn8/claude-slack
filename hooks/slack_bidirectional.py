@@ -148,9 +148,15 @@ def main():
         # Don't send full parameters, just tool name
         message_text = f"Session: {session_id}\nTool: {tool_name}"
 
+    elif event_type == "Notification":
+        # Notification events are handled by on_notification.py hook
+        # Skip to avoid duplicate messages
+        sys.exit(0)
+
     else:
-        # Generic event
-        message_text = json.dumps(input_data, indent=2)[:500]
+        # Unknown event type - log but don't send JSON dump to Slack
+        print(f"⚠️  Unknown event type: {event_type}", file=sys.stderr)
+        sys.exit(0)
 
     # Send to Slack
     send_to_slack(message_text, event_type)

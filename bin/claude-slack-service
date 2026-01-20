@@ -1,0 +1,132 @@
+#!/bin/bash
+# Claude Slack Listener - Systemd Service Manager
+# Usage: claude-slack-service [install|uninstall|start|stop|restart|status|logs]
+
+set -e
+
+SERVICE_NAME="claude-slack-listener"
+SERVICE_FILE="$HOME/.claude/claude-slack/systemd/${SERVICE_NAME}.service"
+USER_SERVICE_DIR="$HOME/.config/systemd/user"
+
+show_help() {
+    echo "Claude Slack Listener - Systemd Service Manager"
+    echo ""
+    echo "Usage: claude-slack-service <command>"
+    echo ""
+    echo "Commands:"
+    echo "  install   - Install and enable the service"
+    echo "  uninstall - Stop and remove the service"
+    echo "  start     - Start the service"
+    echo "  stop      - Stop the service"
+    echo "  restart   - Restart the service"
+    echo "  status    - Show service status"
+    echo "  logs      - Show service logs (follow mode)"
+    echo ""
+}
+
+install_service() {
+    echo "Installing Claude Slack Listener service..."
+
+    # Create user systemd directory
+    mkdir -p "$USER_SERVICE_DIR"
+
+    # Copy service file
+    cp "$SERVICE_FILE" "$USER_SERVICE_DIR/"
+
+    # Tighten permissions on sensitive files
+    chmod 600 "$HOME/.claude/claude-slack/.env"
+    chmod 700 "$HOME/.claude/slack/sockets" 2>/dev/null || mkdir -p "$HOME/.claude/slack/sockets" && chmod 700 "$HOME/.claude/slack/sockets"
+
+    # Reload systemd
+    systemctl --user daemon-reload
+
+    # Enable service (start on login)
+    systemctl --user enable "$SERVICE_NAME"
+
+    # Enable lingering (keeps user services running after logout)
+    echo "Enabling lingering for user services..."
+    loginctl enable-linger "$USER"
+
+    echo ""
+    echo "✅ Service installed successfully!"
+    echo ""
+    echo "To start now:  claude-slack-service start"
+    echo "To view logs:  claude-slack-service logs"
+    echo ""
+}
+
+uninstall_service() {
+    echo "Uninstalling Claude Slack Listener service..."
+
+    # Stop service if running
+    systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
+
+    # Disable service
+    systemctl --user disable "$SERVICE_NAME" 2>/dev/null || true
+
+    # Remove service file
+    rm -f "$USER_SERVICE_DIR/${SERVICE_NAME}.service"
+
+    # Reload systemd
+    systemctl --user daemon-reload
+
+    echo "✅ Service uninstalled"
+}
+
+start_service() {
+    echo "Starting Claude Slack Listener..."
+    systemctl --user start "$SERVICE_NAME"
+    sleep 2
+    systemctl --user status "$SERVICE_NAME" --no-pager
+}
+
+stop_service() {
+    echo "Stopping Claude Slack Listener..."
+    systemctl --user stop "$SERVICE_NAME"
+    echo "✅ Service stopped"
+}
+
+restart_service() {
+    echo "Restarting Claude Slack Listener..."
+    systemctl --user restart "$SERVICE_NAME"
+    sleep 2
+    systemctl --user status "$SERVICE_NAME" --no-pager
+}
+
+show_status() {
+    systemctl --user status "$SERVICE_NAME" --no-pager
+}
+
+show_logs() {
+    echo "Showing logs (Ctrl+C to exit)..."
+    journalctl --user -u "$SERVICE_NAME" -f
+}
+
+# Main
+case "${1:-}" in
+    install)
+        install_service
+        ;;
+    uninstall)
+        uninstall_service
+        ;;
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    status)
+        show_status
+        ;;
+    logs)
+        show_logs
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac

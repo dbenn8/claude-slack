@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Install Claude-Slack Global Hooks
+
+Merges claude-slack hooks into ~/.claude/settings.json so they apply
+to all Claude Code sessions, regardless of which project directory
+Claude is running in.
+
+Usage:
+    ./bin/install-hooks           # Install hooks
+    ./bin/install-hooks --remove  # Remove hooks
+
+This script:
+- Preserves existing settings (permissions, mcpServers, etc.)
+- Merges hooks configuration (won't duplicate if already present)
+- Creates ~/.claude/settings.json if it doesn't exist
+- Is idempotent (safe to run multiple times)
+"""
+
+import json
+import os
+import sys
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+# Standard install location
+CLAUDE_SLACK_DIR = Path.home() / ".claude" / "claude-slack"
+HOOKS_DIR = CLAUDE_SLACK_DIR / ".claude" / "hooks"
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+# Hook configurations to install
+HOOKS_CONFIG = {
+    "PreToolUse": [
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.claude/claude-slack/.claude/hooks/on_pretooluse.py",
+                    "timeout": 5
+                }
+            ]
+        }
+    ],
+    "PostToolUse": [
+        {
+            "matcher": "TodoWrite",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.claude/claude-slack/.claude/hooks/on_posttooluse.py",
+                    "timeout": 5
+                }
+            ]
+        }
+    ],
+    "Stop": [
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.claude/claude-slack/.claude/hooks/on_stop.py"
+                }
+            ]
+        }
+    ],
+    "Notification": [
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "python3 ~/.claude/claude-slack/.claude/hooks/on_notification.py"
+                }
+            ]
+        }
+    ]
+}
+
+# Marker to identify our hooks
+HOOK_MARKER = "~/.claude/claude-slack/.claude/hooks/"
+
+
+def load_settings() -> dict:
+    """Load existing settings or return empty dict."""
+    if SETTINGS_PATH.exists():
+        try:
+            with open(SETTINGS_PATH, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Error: Could not parse {SETTINGS_PATH}: {e}", file=sys.stderr)
+            sys.exit(1)
+    return {}
+
+
+def save_settings(settings: dict) -> None:
+    """Save settings with backup."""
+    # Create backup if file exists
+    if SETTINGS_PATH.exists():
+        backup_path = SETTINGS_PATH.with_suffix(f'.json.backup.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        shutil.copy(SETTINGS_PATH, backup_path)
+        print(f"  Backup created: {backup_path}")
+
+    # Ensure directory exists
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write settings
+    with open(SETTINGS_PATH, 'w') as f:
+        json.dump(settings, f, indent=2)
+        f.write('\n')
+
+
+def is_our_hook(hook_entry: dict) -> bool:
+    """Check if a hook entry is from claude-slack."""
+    for hook in hook_entry.get('hooks', []):
+        command = hook.get('command', '')
+        if HOOK_MARKER in command:
+            return True
+    return False
+
+
+def remove_our_hooks(hooks: dict) -> dict:
+    """Remove claude-slack hooks from hooks config."""
+    cleaned = {}
+    for event, entries in hooks.items():
+        cleaned_entries = [e for e in entries if not is_our_hook(e)]
+        if cleaned_entries:
+            cleaned[event] = cleaned_entries
+    return cleaned
+
+
+def merge_hooks(existing: dict, new: dict) -> dict:
+    """Merge new hooks into existing, avoiding duplicates."""
+    # First remove any existing claude-slack hooks
+    result = remove_our_hooks(existing)
+
+    # Then add our hooks
+    for event, entries in new.items():
+        if event not in result:
+            result[event] = []
+        result[event].extend(entries)
+
+    return result
+
+
+def install_hooks() -> None:
+    """Install claude-slack hooks into global settings."""
+    print("Installing claude-slack global hooks...")
+    print(f"  Settings file: {SETTINGS_PATH}")
+    print(f"  Hooks directory: {HOOKS_DIR}")
+
+    # Verify hooks exist
+    if not HOOKS_DIR.exists():
+        print(f"\nError: Hooks directory not found: {HOOKS_DIR}", file=sys.stderr)
+        print("Make sure claude-slack is installed at ~/.claude/claude-slack/", file=sys.stderr)
+        sys.exit(1)
+
+    required_hooks = ['on_notification.py', 'on_stop.py', 'on_pretooluse.py', 'on_posttooluse.py']
+    missing = [h for h in required_hooks if not (HOOKS_DIR / h).exists()]
+    if missing:
+        print(f"\nError: Missing hook files: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load existing settings
+    settings = load_settings()
+
+    # Merge hooks
+    existing_hooks = settings.get('hooks', {})
+    settings['hooks'] = merge_hooks(existing_hooks, HOOKS_CONFIG)
+
+    # Save
+    save_settings(settings)
+
+    print("\n✓ Hooks installed successfully!")
+    print("\nInstalled hooks:")
+    for event in HOOKS_CONFIG:
+        print(f"  - {event}")
+    print("\nNote: Restart Claude Code for hooks to take effect.")
+    print("You can verify with: claude /hooks")
+
+
+def remove_hooks() -> None:
+    """Remove claude-slack hooks from global settings."""
+    print("Removing claude-slack global hooks...")
+    print(f"  Settings file: {SETTINGS_PATH}")
+
+    if not SETTINGS_PATH.exists():
+        print("\nNo settings file found, nothing to remove.")
+        return
+
+    # Load existing settings
+    settings = load_settings()
+
+    if 'hooks' not in settings:
+        print("\nNo hooks configured, nothing to remove.")
+        return
+
+    # Remove our hooks
+    settings['hooks'] = remove_our_hooks(settings.get('hooks', {}))
+
+    # Remove empty hooks key
+    if not settings['hooks']:
+        del settings['hooks']
+
+    # Save
+    save_settings(settings)
+
+    print("\n✓ Hooks removed successfully!")
+    print("\nNote: Restart Claude Code for changes to take effect.")
+
+
+def show_status() -> None:
+    """Show current hook installation status."""
+    print("Claude-Slack Hooks Status")
+    print("=" * 40)
+    print(f"Settings file: {SETTINGS_PATH}")
+    print(f"Hooks directory: {HOOKS_DIR}")
+    print()
+
+    if not SETTINGS_PATH.exists():
+        print("Status: Not installed (no settings file)")
+        return
+
+    settings = load_settings()
+    hooks = settings.get('hooks', {})
+
+    installed_events = []
+    for event, entries in hooks.items():
+        for entry in entries:
+            if is_our_hook(entry):
+                installed_events.append(event)
+                break
+
+    if installed_events:
+        print("Status: Installed")
+        print("Events with claude-slack hooks:")
+        for event in installed_events:
+            print(f"  - {event}")
+    else:
+        print("Status: Not installed")
+
+
+def main():
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ('--remove', '-r', 'remove'):
+            remove_hooks()
+        elif arg in ('--status', '-s', 'status'):
+            show_status()
+        elif arg in ('--help', '-h', 'help'):
+            print(__doc__)
+        else:
+            print(f"Unknown argument: {arg}", file=sys.stderr)
+            print("Usage: install-hooks [--remove|--status|--help]", file=sys.stderr)
+            sys.exit(1)
+    else:
+        install_hooks()
+
+
+if __name__ == "__main__":
+    main()

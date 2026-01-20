@@ -2,6 +2,15 @@
 """
 Claude Code Stop Hook - Post Assistant Responses to Slack
 
+Version: 1.4.0
+
+Changelog:
+- v1.4.0 (2026/01/18): Clean up stale permission messages when Claude responds
+- v1.3.0 (2026/01/17): Added rich session summaries with progress, files modified, and completion status
+- v1.2.0 (2026/01/17): Added reply_to_ts threading - responses thread to the message that triggered them
+- v1.1.0 (2025/11/18): Fixed early termination bug - continue posting remaining chunks on failure
+- v1.0.0 (2025/11/18): Initial versioned release
+
 Triggered when Claude finishes processing a user prompt.
 Reads the transcript, extracts the latest assistant response, and posts it to Slack.
 
@@ -14,7 +23,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -30,7 +39,7 @@ Architecture:
     5. Exit 0 (success or failure)
 
 Debug Logging:
-    - All execution logged to /tmp/stop_hook_debug.log
+    - All execution logged to ~/.claude/slack/logs/stop_hook_debug.log
     - Includes timestamps, session info, environment vars
     - Tracks hook lifecycle from entry to exit
 """
@@ -41,8 +50,15 @@ import os
 from pathlib import Path
 from datetime import datetime
 
+# Hook version for auto-update detection
+HOOK_VERSION = "1.4.0"
+
+# Log directory - use ~/.claude/slack/logs as default
+LOG_DIR = os.environ.get("SLACK_LOG_DIR", os.path.expanduser("~/.claude/slack/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # Debug log file path
-DEBUG_LOG = "/tmp/stop_hook_debug.log"
+DEBUG_LOG = os.path.join(LOG_DIR, "stop_hook_debug.log")
 
 # Find claude-slack directory dynamically
 # Hooks are templates that get copied to project folders, but they need to find the
@@ -213,13 +229,280 @@ def split_message(text: str, max_length: int = 39000) -> list:
     return chunks
 
 
-def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
+def format_rich_summary_blocks(summary: dict) -> list:
     """
-    Post message to Slack thread, handling long messages.
+    Format rich summary as Slack Block Kit blocks.
+
+    Args:
+        summary: Rich summary dict from transcript_parser.get_rich_summary()
+
+    Returns:
+        List of Slack Block Kit blocks
+    """
+    blocks = []
+
+    # Header with status
+    is_complete = summary.get('is_complete', False)
+    stop_reason = summary.get('stop_reason', 'unknown')
+
+    if is_complete:
+        status_emoji = "✅"
+        status_text = "Session Complete"
+    elif stop_reason == 'error':
+        status_emoji = "❌"
+        status_text = "Session Ended with Error"
+    elif stop_reason == 'interrupted':
+        status_emoji = "⚠️"
+        status_text = "Session Interrupted"
+    else:
+        status_emoji = "🔚"
+        status_text = "Session Ended"
+
+    blocks.append({
+        "type": "header",
+        "text": {
+            "type": "plain_text",
+            "text": f"{status_emoji} {status_text}",
+            "emoji": True
+        }
+    })
+
+    # Initial task (if available)
+    initial_task = summary.get('initial_task')
+    if initial_task:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Task:* {initial_task}"
+            }
+        })
+
+    # Divider
+    blocks.append({"type": "divider"})
+
+    # Todo status (if any)
+    todos = summary.get('todos')
+    if todos:
+        completed_count = todos.get('completed', 0)
+        total_count = todos.get('total', 0)
+
+        # Progress bar
+        if total_count > 0:
+            progress_pct = int((completed_count / total_count) * 100)
+            filled = int(progress_pct / 10)
+            progress_bar = "█" * filled + "░" * (10 - filled)
+        else:
+            progress_pct = 0
+            progress_bar = "░" * 10
+
+        todo_text = f"*Progress:* {progress_bar} {progress_pct}% ({completed_count}/{total_count} tasks)\n"
+
+        # Completed items
+        completed_items = todos.get('completed_items', [])
+        if completed_items:
+            todo_text += "\n*Completed:*\n"
+            for item in completed_items[:5]:  # Limit to 5
+                todo_text += f"• ~~{item}~~\n"
+            if len(completed_items) > 5:
+                todo_text += f"_...and {len(completed_items) - 5} more_\n"
+
+        # In progress items
+        in_progress_items = todos.get('in_progress_items', [])
+        if in_progress_items:
+            todo_text += "\n*In Progress:*\n"
+            for item in in_progress_items:
+                todo_text += f"• 🔄 {item}\n"
+
+        # Pending items
+        pending_items = todos.get('pending_items', [])
+        if pending_items:
+            todo_text += "\n*Remaining:*\n"
+            for item in pending_items[:5]:  # Limit to 5
+                todo_text += f"• ⏳ {item}\n"
+            if len(pending_items) > 5:
+                todo_text += f"_...and {len(pending_items) - 5} more_\n"
+
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": todo_text.strip()
+            }
+        })
+
+    # Modified files (if any)
+    modified_files = summary.get('modified_files', [])
+    if modified_files:
+        files_text = "*Files Modified:*\n"
+        for f in modified_files[:10]:  # Limit to 10
+            # Shorten path for display
+            short_path = f.split('/')[-1] if '/' in f else f
+            files_text += f"• `{short_path}`\n"
+        if len(modified_files) > 10:
+            files_text += f"_...and {len(modified_files) - 10} more_\n"
+
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": files_text.strip()
+            }
+        })
+
+    # Stats footer
+    conv = summary.get('conversation', {})
+    usage = summary.get('usage', {})
+    model = summary.get('model', 'unknown')
+
+    stats_parts = []
+    if conv.get('user_messages'):
+        stats_parts.append(f"{conv['user_messages']} prompts")
+    if conv.get('assistant_messages'):
+        stats_parts.append(f"{conv['assistant_messages']} responses")
+    if usage.get('input_tokens'):
+        stats_parts.append(f"{usage['input_tokens']:,} input tokens")
+    if usage.get('output_tokens'):
+        stats_parts.append(f"{usage['output_tokens']:,} output tokens")
+
+    if stats_parts:
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"📊 {' • '.join(stats_parts)} • Model: {model}"
+                }
+            ]
+        })
+
+    return blocks
+
+
+def post_rich_summary(channel: str, thread_ts: str, summary: dict, bot_token: str) -> bool:
+    """
+    Post a rich summary to Slack using Block Kit.
 
     Args:
         channel: Slack channel ID
-        thread_ts: Thread timestamp
+        thread_ts: Thread timestamp (None for top-level)
+        summary: Rich summary dict
+        bot_token: Slack bot token
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        log_error("slack_sdk not installed. Run: pip install slack-sdk")
+        return False
+
+    client = WebClient(token=bot_token)
+    blocks = format_rich_summary_blocks(summary)
+
+    # Fallback text
+    is_complete = summary.get('is_complete', False)
+    fallback_text = "Session Complete" if is_complete else "Session Ended"
+
+    try:
+        msg_params = {
+            "channel": channel,
+            "text": fallback_text,
+            "blocks": blocks
+        }
+        if thread_ts:
+            msg_params["thread_ts"] = thread_ts
+
+        client.chat_postMessage(**msg_params)
+        log_info("Posted rich summary to Slack")
+        return True
+
+    except SlackApiError as e:
+        log_error(f"Slack API error posting summary: {e.response['error']}")
+        return False
+    except Exception as e:
+        log_error(f"Error posting summary: {e}")
+        return False
+
+
+def cleanup_stale_permission_message(session: dict, db, bot_token: str) -> bool:
+    """
+    Clean up any stale permission message for a session.
+
+    When a user responds to a permission prompt via terminal (not Slack),
+    the Slack message with buttons stays visible. This function deletes
+    that stale message when Claude continues (responds to user).
+
+    Args:
+        session: Session dict from registry
+        db: RegistryDatabase instance
+        bot_token: Slack bot token
+
+    Returns:
+        True if message was cleaned up, False otherwise
+    """
+    permission_ts = session.get('permission_message_ts')
+    if not permission_ts:
+        debug_log("No pending permission message to clean up", "CLEANUP")
+        return False
+
+    channel = session.get('channel')
+    if not channel:
+        debug_log("No channel for permission cleanup", "CLEANUP")
+        return False
+
+    debug_log(f"Found stale permission message: {permission_ts} in channel {channel}", "CLEANUP")
+
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+
+        client = WebClient(token=bot_token)
+
+        # Delete the stale permission message
+        client.chat_delete(
+            channel=channel,
+            ts=permission_ts
+        )
+
+        log_info(f"Cleaned up stale permission message: {permission_ts}")
+
+        # Clear the permission_message_ts in the registry
+        session_id = session.get('session_id')
+        if session_id:
+            db.update_session(session_id, {'permission_message_ts': None})
+            debug_log(f"Cleared permission_message_ts for session {session_id[:8]}", "CLEANUP")
+
+        return True
+
+    except SlackApiError as e:
+        error_msg = e.response.get('error', str(e))
+        if error_msg == 'message_not_found':
+            # Message was already deleted (e.g., via button click)
+            debug_log(f"Permission message already deleted: {permission_ts}", "CLEANUP")
+            # Still clear the ts in registry
+            session_id = session.get('session_id')
+            if session_id:
+                db.update_session(session_id, {'permission_message_ts': None})
+            return True
+        else:
+            log_error(f"Failed to delete permission message: {error_msg}")
+        return False
+
+    except Exception as e:
+        log_error(f"Error cleaning up permission message: {e}")
+        return False
+
+
+def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
+    """
+    Post message to Slack thread or channel, handling long messages.
+
+    Args:
+        channel: Slack channel ID
+        thread_ts: Thread timestamp (None for top-level messages in custom channel mode)
         text: Message text
         bot_token: Slack bot token
     """
@@ -241,6 +524,7 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
         chunks = chunks[:5]
 
     # Post each chunk
+    failed_chunks = []
     for i, chunk in enumerate(chunks):
         try:
             # Add part indicator for multi-part messages
@@ -249,20 +533,30 @@ def post_to_slack(channel: str, thread_ts: str, text: str, bot_token: str):
             else:
                 message_text = chunk
 
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=message_text
-            )
+            # Build message params - only include thread_ts if set
+            msg_params = {
+                "channel": channel,
+                "text": message_text
+            }
+            if thread_ts:
+                msg_params["thread_ts"] = thread_ts
+
+            client.chat_postMessage(**msg_params)
 
             log_info(f"Posted to Slack (part {i+1}/{len(chunks)})")
 
         except SlackApiError as e:
-            log_error(f"Slack API error: {e.response['error']}")
-            return False
+            log_error(f"Slack API error on chunk {i+1}: {e.response['error']}")
+            failed_chunks.append(i+1)
+            continue
         except Exception as e:
-            log_error(f"Error posting to Slack: {e}")
-            return False
+            log_error(f"Error posting chunk {i+1} to Slack: {e}")
+            failed_chunks.append(i+1)
+            continue
+
+    if failed_chunks:
+        log_error(f"Failed to post chunks: {failed_chunks}")
+        return False
 
     return True
 
@@ -359,8 +653,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
@@ -380,11 +673,14 @@ def main():
         # Extract Slack metadata
         slack_channel = session.get("channel")
         slack_thread_ts = session.get("thread_ts")
+        reply_to_ts = session.get("reply_to_ts")  # Message to thread response to
         debug_log(f"Slack channel: {slack_channel}", "SLACK")
         debug_log(f"Slack thread_ts: {slack_thread_ts}", "SLACK")
+        debug_log(f"Reply to ts: {reply_to_ts}", "SLACK")
 
         # SELF-HEALING: If session exists but Slack metadata is missing
-        if not slack_channel or not slack_thread_ts:
+        # Note: thread_ts can be None for custom channel mode
+        if not slack_channel:
             log_info(f"Session {session_id[:8]} missing Slack metadata, attempting self-heal...")
             debug_log("Attempting self-healing for missing Slack metadata", "REGISTRY")
 
@@ -396,20 +692,23 @@ def main():
                 debug_log(f"Looking for wrapper session: {wrapper_session_id}", "REGISTRY")
                 wrapper_session = db.get_session(wrapper_session_id)
 
-                if wrapper_session and wrapper_session.get("thread_ts") and wrapper_session.get("channel"):
+                # Only require channel (thread_ts can be None for custom channel mode)
+                if wrapper_session and wrapper_session.get("channel"):
                     log_info(f"Found wrapper session {wrapper_session_id} with metadata, copying...")
                     debug_log(f"Wrapper has thread_ts={wrapper_session.get('thread_ts')}, channel={wrapper_session.get('channel')}", "REGISTRY")
 
                     # Copy metadata to Claude session
                     db.update_session(session_id, {
                         'slack_thread_ts': wrapper_session.get("thread_ts"),
-                        'slack_channel': wrapper_session.get("channel")
+                        'slack_channel': wrapper_session.get("channel"),
+                        'reply_to_ts': wrapper_session.get("reply_to_ts")
                     })
 
                     # Re-query to get updated session
                     session = db.get_session(session_id)
                     slack_channel = session.get("channel")
                     slack_thread_ts = session.get("thread_ts")
+                    reply_to_ts = session.get("reply_to_ts")
 
                     log_info(f"Self-healed: thread_ts={slack_thread_ts}, channel={slack_channel}")
                     debug_log("Self-healing successful", "REGISTRY")
@@ -422,11 +721,22 @@ def main():
                 sys.exit(0)
 
         # Final check after self-healing attempt
-        if not slack_channel or not slack_thread_ts:
-            log_error(f"Session {session_id[:8]} missing Slack metadata after self-healing (channel={slack_channel}, thread_ts={slack_thread_ts})")
+        # Note: thread_ts can be None for custom channel mode
+        if not slack_channel:
+            log_error(f"Session {session_id[:8]} missing Slack channel after self-healing")
             sys.exit(0)
 
-        log_info(f"Found Slack thread: {slack_channel} / {slack_thread_ts}")
+        # Determine which thread_ts to use for response
+        # Priority: reply_to_ts (specific message) > thread_ts (session thread) > None (top-level)
+        response_thread_ts = reply_to_ts or slack_thread_ts
+        if reply_to_ts:
+            log_info(f"Threading response to message: {reply_to_ts}")
+        elif slack_thread_ts:
+            log_info(f"Using session thread: {slack_thread_ts}")
+        else:
+            log_info(f"Custom channel mode: posting top-level message")
+
+        log_info(f"Posting to: {slack_channel} / {response_thread_ts or 'top-level'}")
 
         # Get Slack bot token
         bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -436,15 +746,88 @@ def main():
 
         debug_log("Bot token found, posting to Slack...", "SLACK")
 
-        # Post to Slack
-        success = post_to_slack(slack_channel, slack_thread_ts, response_text, bot_token)
+        # Clean up any stale permission message before posting response
+        # This handles the case where user responded via terminal (not Slack)
+        perm_ts = session.get('permission_message_ts')
+        debug_log(f"Checking for stale permission message: permission_message_ts={perm_ts}", "CLEANUP")
+        if perm_ts:
+            debug_log(f"Found stale permission_message_ts={perm_ts}, cleaning up...", "CLEANUP")
+            cleanup_stale_permission_message(session, db, bot_token)
+        else:
+            debug_log("No permission_message_ts to clean up", "CLEANUP")
+
+        # Post to Slack (response_thread_ts may be None for top-level)
+        success = post_to_slack(slack_channel, response_thread_ts, response_text, bot_token)
+
+        # Clear reply_to_ts after posting (so next response doesn't use same thread)
+        if reply_to_ts:
+            try:
+                db.update_session(session_id, {'reply_to_ts': None})
+                debug_log("Cleared reply_to_ts after posting", "SLACK")
+            except Exception as e:
+                debug_log(f"Could not clear reply_to_ts: {e}", "SLACK")
 
         if success:
-            log_info("Successfully posted to Slack")
-            debug_log("Slack post successful", "SLACK")
+            log_info("Successfully posted response to Slack")
+            debug_log("Slack response post successful", "SLACK")
         else:
-            log_info("Failed to post to Slack (see errors above)")
-            debug_log("Slack post failed", "SLACK")
+            log_info("Failed to post response to Slack (see errors above)")
+            debug_log("Slack response post failed", "SLACK")
+
+        # Forward full response to DM subscribers
+        try:
+            from dm_mode import forward_to_dm_subscribers
+            from slack_sdk import WebClient
+            dm_client = WebClient(token=bot_token)
+            forward_to_dm_subscribers(db, session_id, response_text, dm_client)
+            debug_log("Forwarded response to DM subscribers", "DM")
+        except ImportError:
+            debug_log("dm_mode not available, skipping DM forwarding", "DM")
+        except Exception as e:
+            debug_log(f"Error forwarding to DM: {e}", "DM")
+
+        # Generate and post rich summary
+        debug_log("Generating rich summary...", "SUMMARY")
+        try:
+            rich_summary = parser.get_rich_summary()
+            debug_log(f"Rich summary type: {type(rich_summary).__name__}", "SUMMARY")
+            if isinstance(rich_summary, dict):
+                debug_log(f"Rich summary keys: {list(rich_summary.keys())}", "SUMMARY")
+                debug_log(f"Rich summary generated: complete={rich_summary.get('is_complete')}", "SUMMARY")
+            else:
+                debug_log(f"WARNING: rich_summary is not a dict: {str(rich_summary)[:200]}", "SUMMARY")
+                # Skip posting if not a dict
+                raise TypeError(f"get_rich_summary returned {type(rich_summary).__name__}, expected dict")
+
+            # Post summary to the session thread (not the reply_to thread)
+            # This keeps the summary in the main conversation
+            summary_thread = slack_thread_ts  # Use session thread, not reply_to
+            summary_success = post_rich_summary(slack_channel, summary_thread, rich_summary, bot_token)
+
+            if summary_success:
+                log_info("Successfully posted rich summary to Slack")
+                debug_log("Slack summary post successful", "SUMMARY")
+            else:
+                log_info("Failed to post rich summary (see errors above)")
+                debug_log("Slack summary post failed", "SUMMARY")
+        except Exception as e:
+            log_error(f"Error generating/posting rich summary: {e}")
+            debug_log(f"Summary error: {e}", "SUMMARY")
+            import traceback
+            tb = traceback.format_exc()
+            debug_log(f"Summary traceback:\n{tb}", "SUMMARY")
+
+        # Handle session end - notify and cleanup DM subscriptions
+        try:
+            from dm_mode import handle_session_end
+            from slack_sdk import WebClient
+            dm_client = WebClient(token=bot_token)
+            handle_session_end(db, session_id, dm_client)
+            debug_log("Notified DM subscribers of session end", "DM")
+        except ImportError:
+            debug_log("dm_mode not available, skipping session end cleanup", "DM")
+        except Exception as e:
+            debug_log(f"Error handling session end for DM: {e}", "DM")
 
     except Exception as e:
         # Catch-all error handler

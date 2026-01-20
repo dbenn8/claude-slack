@@ -59,8 +59,12 @@ load_dotenv(env_path)
 
 try:
     from core.config import get_socket_dir, get_log_dir, get_claude_bin
+    from core.session_discovery import find_active_session
+    from core.line_logger import LineLogger
 except ModuleNotFoundError:
     from config import get_socket_dir, get_log_dir, get_claude_bin
+    from session_discovery import find_active_session
+    from line_logger import LineLogger
 
 # Configuration
 SOCKET_DIR = os.environ.get("SLACK_SOCKET_DIR", get_socket_dir())
@@ -374,14 +378,21 @@ class RegistryClient:
             debug_log(f"Registry communication error: {e}")
             return None
 
-    def register(self, project, terminal, socket_path):
+    def register(self, project, terminal, socket_path, project_dir=None, description=None, custom_channel=None, permissions_channel=None):
         """Register session with registry and create Slack thread"""
         data = {
             "session_id": self.session_id,
             "project": project,
+            "project_dir": project_dir,
             "terminal": terminal,
             "socket_path": socket_path
         }
+        if description:
+            data["description"] = description
+        if custom_channel:
+            data["custom_channel"] = custom_channel  # Override default channel (top-level messages)
+        if permissions_channel:
+            data["permissions_channel"] = permissions_channel  # Separate channel for permissions
 
         response = self._send_command("REGISTER", data)
 
@@ -395,14 +406,33 @@ class RegistryClient:
 
         return False
 
+    def update_session(self, session_id, updates):
+        """Update session data in registry.
+
+        Args:
+            session_id: Session ID to update
+            updates: Dict of fields to update (e.g., {'buffer_file_path': '/path/to/file'})
+
+        Returns:
+            True if successful, False otherwise
+        """
+        response = self._send_command("UPDATE", {
+            "session_id": session_id,
+            "updates": updates
+        })
+        return response and response.get("success", False)
+
 
 class HybridPTYWrapper:
     """Hybrid PTY wrapper combining input control with hooks output"""
 
-    def __init__(self, session_id, project_dir, claude_args=None):
+    def __init__(self, session_id, project_dir, claude_args=None, description=None, channel=None, permissions_channel=None):
         self.session_id = session_id
         self.project_dir = project_dir
         self.claude_args = claude_args or []
+        self.description = description  # Optional description for Slack thread
+        self.custom_channel = channel   # Optional channel override (uses top-level messages)
+        self.permissions_channel = permissions_channel  # Separate channel for permissions
 
         # Setup logging
         self.logger = setup_logging(session_id)
@@ -411,6 +441,12 @@ class HybridPTYWrapper:
         self.logger.info(f"Session ID: {session_id}")
         self.logger.info(f"Project directory: {project_dir}")
         self.logger.info(f"Claude args: {claude_args}")
+        if description:
+            self.logger.info(f"Description: {description}")
+        if channel:
+            self.logger.info(f"Custom channel: {channel} (top-level messages)")
+        if permissions_channel:
+            self.logger.info(f"Permissions channel: {permissions_channel}")
         self.logger.info(f"Python version: {sys.version}")
         self.logger.info(f"Working directory: {os.getcwd()}")
 
@@ -443,9 +479,74 @@ class HybridPTYWrapper:
         # Output buffer for capturing exact permission prompts (4KB ring buffer)
         # Increased from 1KB to 4KB to capture all 3 permission options
         self.output_buffer = deque(maxlen=4096)
-        self.buffer_file = f"/tmp/claude_output_{session_id}.txt"
+
+        # Check if we're resuming a session - if so, use that ID for the buffer file
+        # This ensures the buffer file is available immediately for hooks
+        resumed_session_id = self._extract_resume_session_id()
+        if resumed_session_id:
+            self.buffer_file = os.path.join(LOG_DIR, f"claude_output_{resumed_session_id}.txt")
+            self.claude_session_uuid = resumed_session_id  # Pre-set so we don't re-detect
+            self.logger.info(f"Resuming session {resumed_session_id[:8]} - buffer file set immediately")
+        else:
+            self.buffer_file = os.path.join(LOG_DIR, f"claude_output_{session_id}.txt")
+
         self.buffer_lock = threading.Lock()
         self.logger.info(f"Output buffer initialized: {self.buffer_file}")
+
+        # Initialize LineLogger for session change detection
+        self.line_logger = LineLogger(max_lines=500)
+        self.log_dir = Path(LOG_DIR)
+        self.line_log_file = self.log_dir / f"claude_lines_{session_id}.txt"
+        self.logger.info(f"LineLogger initialized: {self.line_log_file}")
+
+    def _extract_resume_session_id(self):
+        """
+        Extract session ID if resuming a session.
+
+        Checks claude_args for --resume flag and extracts the session ID.
+        If --resume is present without explicit ID, tries to find the most recent session.
+
+        Returns:
+            Session ID string if resuming, None otherwise
+        """
+        if not self.claude_args:
+            return None
+
+        # Look for --resume or -r flag
+        for i, arg in enumerate(self.claude_args):
+            if arg in ('--resume', '-r'):
+                # Check if next arg is a session ID (UUID format)
+                if i + 1 < len(self.claude_args):
+                    next_arg = self.claude_args[i + 1]
+                    # Session IDs are UUIDs (36 chars with dashes)
+                    if len(next_arg) == 36 and next_arg.count('-') == 4:
+                        self.logger.info(f"Found explicit resume session ID: {next_arg[:8]}")
+                        return next_arg
+                    # Could also be short form or partial
+                    if len(next_arg) >= 8 and not next_arg.startswith('-'):
+                        self.logger.info(f"Found resume session ID (short): {next_arg[:8]}")
+                        return next_arg
+
+                # No explicit ID - try to find most recent session from transcripts
+                self.logger.debug("--resume without explicit ID, looking for most recent session")
+                try:
+                    transcript_dir = Path.home() / ".claude" / "projects" / self.project_dir.replace('/', '-').lstrip('-')
+                    if transcript_dir.exists():
+                        transcript_files = sorted(
+                            transcript_dir.glob("*.jsonl"),
+                            key=lambda f: f.stat().st_mtime,
+                            reverse=True
+                        )
+                        if transcript_files:
+                            session_id = transcript_files[0].stem
+                            self.logger.info(f"Found most recent session for resume: {session_id[:8]}")
+                            return session_id
+                except Exception as e:
+                    self.logger.warning(f"Could not find session for --resume: {e}")
+
+                return None
+
+        return None
 
     def setup_socket_directory(self):
         """Create socket directory if it doesn't exist"""
@@ -570,8 +671,12 @@ class HybridPTYWrapper:
         self.logger.info(f"Sending REGISTER command to registry (will create Slack thread)")
         success = self.registry.register(
             project=os.path.basename(self.project_dir),
+            project_dir=self.project_dir,
             terminal=terminal,
-            socket_path=self.socket_path
+            socket_path=self.socket_path,
+            description=self.description,
+            custom_channel=self.custom_channel,
+            permissions_channel=self.permissions_channel
         )
 
         if success:
@@ -599,8 +704,9 @@ class HybridPTYWrapper:
         self.logger.info(f"Attempting to register Claude session ID: {claude_session_id}")
         self.logger.debug(f"Registry available: {self.registry.available}, thread_ts: {self.thread_ts}, channel: {self.channel}")
 
-        if not self.registry.available or not self.thread_ts:
-            self.logger.warning(f"Cannot register Claude session - registry: {self.registry.available}, thread_ts: {self.thread_ts}")
+        # Need at least a channel to register (thread_ts can be None for custom channel mode)
+        if not self.registry.available or not self.channel:
+            self.logger.warning(f"Cannot register Claude session - registry: {self.registry.available}, channel: {self.channel}")
             return False
 
         self.logger.info(f"Registering Claude session ID: {claude_session_id}")
@@ -621,6 +727,7 @@ class HybridPTYWrapper:
                 "data": {
                     "session_id": claude_session_id,
                     "project": os.path.basename(self.project_dir),
+                    "project_dir": self.project_dir,
                     "terminal": os.environ.get("TERM_PROGRAM", "Unknown"),
                     "socket_path": self.socket_path,
                     "thread_ts": self.thread_ts,
@@ -715,6 +822,10 @@ class HybridPTYWrapper:
                                 self.register_claude_session(self.claude_session_uuid)
 
                         # Inject into Claude's stdin
+                        # Normalize line endings - replace \n with \r for terminal input
+                        # This ensures multi-line messages are properly submitted
+                        data = data.replace('\n', '\r')
+
                         # VibeTunnel mode: use queue (no PTY)
                         if hasattr(self, 'slack_input_queue'):
                             # VibeTunnel mode - queue just the text (Enter added in two-step pattern)
@@ -841,10 +952,30 @@ class HybridPTYWrapper:
             # Add to ring buffer (automatically drops oldest if full)
             self.output_buffer.extend(data)
 
+            # Capture timestamp for timing instrumentation
+            buffer_write_time = time.time()
+
             # Write entire buffer to file for notification hook to read
             try:
                 with open(self.buffer_file, 'wb') as f:
                     f.write(bytes(self.output_buffer))
+
+                # Write timing metadata to companion file
+                metadata_file = self.buffer_file.replace('.txt', '.meta')
+                metadata = {
+                    'buffer_write_time': buffer_write_time,
+                    'session_id': self.session_id
+                }
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f)
+
+                # Log timing event for analysis
+                self.logger.debug(f"[TIMING] session_id={self.session_id[:8]} buffer_write={buffer_write_time:.6f}")
+
+                # Update line logger and write to file
+                self.line_logger.add_data(data)
+                self.line_logger.save_to_file(self.line_log_file)
+
             except Exception as e:
                 self.logger.error(f"Failed to write output buffer: {e}")
 
@@ -860,6 +991,105 @@ class HybridPTYWrapper:
             except Exception as e:
                 self.logger.error(f"Failed to clear output buffer: {e}")
 
+    def _check_session_change(self):
+        """
+        Check if a session change is pending and handle it.
+
+        Called periodically from the main I/O loop to detect when Claude
+        executes /compact or /resume commands.
+        """
+        if self.line_logger.session_change_pending:
+            self.logger.info("Session change detected by LineLogger")
+            self._handle_session_change()
+
+    def _handle_session_change(self):
+        """
+        Handle a session change by discovering the new session ID and updating registry.
+
+        This method:
+        1. Acknowledges the session change flag
+        2. Discovers the new session ID using find_active_session()
+        3. Updates the wrapper's session tracking
+        4. Updates the registry with new session ID while preserving Slack thread
+        5. Updates buffer file paths
+        """
+        # Acknowledge the session change flag
+        was_pending = self.line_logger.acknowledge_session_change()
+        if not was_pending:
+            self.logger.debug("Session change already acknowledged")
+            return
+
+        self.logger.info("Handling session change - discovering new session ID")
+
+        # Save old session ID for logging and registry update
+        old_session_id = self.claude_session_uuid if hasattr(self, 'claude_session_uuid') else self.session_id
+
+        # Wait briefly for new session file to be created
+        time.sleep(0.5)
+
+        # Discover new session ID from most recent buffer file
+        new_session_id = find_active_session(self.log_dir)
+
+        if not new_session_id:
+            self.logger.warning("Failed to discover new session ID after session change")
+            return
+
+        if new_session_id == old_session_id:
+            self.logger.info(f"Session ID unchanged: {new_session_id[:8]}")
+            return
+
+        self.logger.info(f"Session change: {old_session_id[:8]} -> {new_session_id[:8]}")
+
+        # Update wrapper's session tracking
+        self.claude_session_uuid = new_session_id
+
+        # Update buffer file paths
+        self.update_buffer_file_path(new_session_id)
+
+        # Update line log file path
+        old_line_log = self.line_log_file
+        self.line_log_file = self.log_dir / f"claude_lines_{new_session_id}.txt"
+        self.logger.info(f"Line log file updated: {old_line_log} -> {self.line_log_file}")
+
+        # Update registry with new session ID, preserving Slack thread
+        if self.registry and self.registry.available:
+            try:
+                # Get existing entry to preserve thread_ts and other metadata
+                # Use the registry's _send_command method to get session data
+                response = self.registry._send_command("GET", {"session_id": old_session_id})
+
+                if response and response.get("success"):
+                    old_entry = response.get("session", {})
+
+                    # Register new session with same Slack metadata
+                    register_data = {
+                        "session_id": new_session_id,
+                        "project": old_entry.get("project", os.path.basename(self.project_dir)),
+                        "project_dir": old_entry.get("project_dir", self.project_dir),
+                        "terminal": old_entry.get("terminal", os.environ.get("TERM_PROGRAM", "Unknown")),
+                        "socket_path": self.socket_path,
+                        "thread_ts": old_entry.get("slack_thread_ts"),
+                        "channel": old_entry.get("slack_channel"),
+                        "permissions_channel": old_entry.get("permissions_channel"),
+                        "slack_user_id": old_entry.get("slack_user_id"),
+                        "reply_to_ts": old_entry.get("reply_to_ts"),
+                        "todo_message_ts": old_entry.get("todo_message_ts"),
+                        "buffer_file_path": self.buffer_file
+                    }
+
+                    # Register the new session with preserved metadata
+                    register_response = self.registry._send_command("REGISTER_EXISTING", {"data": register_data})
+
+                    if register_response and register_response.get("success"):
+                        self.logger.info(f"Registry updated: new session {new_session_id[:8]} registered with preserved Slack thread")
+                    else:
+                        self.logger.warning(f"Failed to register new session in registry: {register_response}")
+                else:
+                    self.logger.warning(f"Could not get old session data from registry: {response}")
+
+            except Exception as e:
+                self.logger.error(f"Error updating registry for session change: {e}", exc_info=True)
+
     def update_buffer_file_path(self, claude_session_id):
         """
         Update buffer file path to use Claude's actual UUID session ID.
@@ -868,7 +1098,7 @@ class HybridPTYWrapper:
             claude_session_id: Claude's full UUID session ID
         """
         old_buffer_file = self.buffer_file
-        new_buffer_file = f"/tmp/claude_output_{claude_session_id}.txt"
+        new_buffer_file = os.path.join(LOG_DIR, f"claude_output_{claude_session_id}.txt")
 
         with self.buffer_lock:
             try:
@@ -891,6 +1121,23 @@ class HybridPTYWrapper:
                 self.buffer_file = new_buffer_file
                 self.logger.info(f"Buffer file path updated to use Claude session ID: {claude_session_id[:8]}")
 
+                # Update line log file path
+                self.line_log_file = self.log_dir / f"claude_lines_{claude_session_id}.txt"
+                self.logger.info(f"Line log file path updated: {self.line_log_file}")
+
+                # Store buffer file path in registry for ALL sessions (wrapper + Claude)
+                # This allows hooks to find the buffer even if session IDs don't match
+                if self.registry and self.registry.available:
+                    try:
+                        # Update wrapper session
+                        self.registry.update_session(self.session_id, {'buffer_file_path': new_buffer_file})
+                        # Update Claude session if registered
+                        if hasattr(self, 'claude_session_uuid') and self.claude_session_uuid:
+                            self.registry.update_session(self.claude_session_uuid, {'buffer_file_path': new_buffer_file})
+                        self.logger.info(f"Stored buffer_file_path in registry: {new_buffer_file}")
+                    except Exception as e:
+                        self.logger.warning(f"Could not store buffer_file_path in registry: {e}")
+
             except Exception as e:
                 self.logger.error(f"Failed to update buffer file path: {e}")
 
@@ -898,6 +1145,18 @@ class HybridPTYWrapper:
         """Clean up resources"""
         self.logger.info("Starting cleanup")
         self.running = False
+
+        # Mark session as inactive in registry
+        if self.registry and self.registry.available:
+            try:
+                self.registry.deactivate_session(self.session_id)
+                self.logger.info(f"Session {self.session_id} marked as inactive")
+                # Also deactivate Claude's session if registered
+                if hasattr(self, 'claude_session_uuid') and self.claude_session_uuid:
+                    self.registry.deactivate_session(self.claude_session_uuid)
+                    self.logger.info(f"Claude session {self.claude_session_uuid[:8]} marked as inactive")
+            except Exception as e:
+                self.logger.error(f"Error deactivating session: {e}")
 
         # Close socket
         if self.socket:
@@ -915,13 +1174,12 @@ class HybridPTYWrapper:
             except Exception as e:
                 self.logger.error(f"Error removing socket file: {e}")
 
-        # Remove buffer file
-        if os.path.exists(self.buffer_file):
-            try:
-                os.remove(self.buffer_file)
-                self.logger.debug(f"Buffer file removed: {self.buffer_file}")
-            except Exception as e:
-                self.logger.error(f"Error removing buffer file: {e}")
+        # NOTE: We intentionally do NOT remove the buffer file here.
+        # The Claude session may continue running after the wrapper exits
+        # (e.g., after context compaction creates a new wrapper).
+        # The buffer file is needed by hooks to get terminal prompt text.
+        # It will be overwritten when a new session starts, so no cleanup needed.
+        self.logger.debug(f"Buffer file preserved for hooks: {self.buffer_file}")
 
         self.logger.info("Cleanup completed")
 
@@ -1009,17 +1267,18 @@ class HybridPTYWrapper:
             else:  # Parent process
                 self.logger.info(f"PTY forked successfully - PID: {pid}, master_fd: {self.master_fd}")
 
-                # Wait for async Slack thread creation to complete
+                # Wait for async Slack thread/channel setup to complete
                 # The REGISTER command creates the thread asynchronously, so we need to
-                # wait for thread_ts and channel to be populated in the database
-                if self.registry.available and not self.thread_ts:
-                    self.logger.info("Waiting for async Slack thread creation...")
+                # wait for channel to be populated in the database
+                # Note: thread_ts may be None for custom channel mode (top-level messages)
+                if self.registry.available and not self.channel:
+                    self.logger.info("Waiting for async Slack channel setup...")
                     max_wait = 10  # seconds
                     start_time = time.time()
 
                     while time.time() - start_time < max_wait:
                         try:
-                            # Query the database directly to check if thread was created
+                            # Query the database directly to check if channel was set
                             import sqlite3
                             db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
                             conn = sqlite3.connect(db_path)
@@ -1031,18 +1290,22 @@ class HybridPTYWrapper:
                             row = cursor.fetchone()
                             conn.close()
 
-                            if row and row[0] and row[1]:
-                                self.thread_ts = row[0]
+                            # Only require channel to be set (thread_ts can be None for custom channels)
+                            if row and row[1]:
+                                self.thread_ts = row[0]  # May be None for custom channel mode
                                 self.channel = row[1]
-                                self.logger.info(f"Slack thread created: {self.thread_ts} in {self.channel}")
+                                if self.thread_ts:
+                                    self.logger.info(f"Slack thread created: {self.thread_ts} in {self.channel}")
+                                else:
+                                    self.logger.info(f"Slack channel set (top-level mode): {self.channel}")
                                 break
                         except Exception as e:
-                            self.logger.debug(f"Error checking thread status: {e}")
+                            self.logger.debug(f"Error checking channel status: {e}")
 
                         time.sleep(0.5)
 
-                    if not self.thread_ts:
-                        self.logger.warning("Timeout waiting for Slack thread creation")
+                    if not self.channel:
+                        self.logger.warning("Timeout waiting for Slack channel setup")
 
                 # Use the Claude session ID we explicitly set with --session-id
                 # This ensures we register the correct session, not some other active session
@@ -1101,6 +1364,9 @@ class HybridPTYWrapper:
                                 else:
                                     break
 
+                            # Check for session change after each iteration
+                            self._check_session_change()
+
                     except (OSError, KeyboardInterrupt):
                         pass
                 else:
@@ -1122,6 +1388,9 @@ class HybridPTYWrapper:
                                 else:
                                     # Claude exited
                                     break
+
+                            # Check for session change after each iteration
+                            self._check_session_change()
 
                     except (OSError, KeyboardInterrupt):
                         pass
@@ -1152,6 +1421,9 @@ def main():
     )
 
     parser.add_argument("--session-id", help="Unique session ID (auto-generated if not provided)")
+    parser.add_argument("--description", "-d", help="Optional description for the Slack thread")
+    parser.add_argument("--channel", "-c", help="Slack channel for this session (overrides default)")
+    parser.add_argument("--permissions-channel", "-p", help="Separate channel for permission prompts")
     parser.add_argument("--help", "-h", action="store_true", help="Show help message")
 
     # Parse known args, remaining go to Claude
@@ -1172,7 +1444,10 @@ def main():
     wrapper = HybridPTYWrapper(
         session_id=session_id,
         project_dir=project_dir,
-        claude_args=claude_args
+        claude_args=claude_args,
+        description=args.description,
+        channel=args.channel,
+        permissions_channel=args.permissions_channel
     )
 
     # Run wrapper

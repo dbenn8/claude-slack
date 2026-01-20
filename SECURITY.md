@@ -109,10 +109,10 @@ grep -E "xoxb-|xapp-" /tmp/*.log
 #### Active Session Monitoring
 ```bash
 # List active sessions
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
+sqlite3 ~/.claude/slack/registry.db "SELECT * FROM sessions;"
 
 # Check for stale sessions
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions WHERE updated_at < datetime('now', '-24 hours');"
+sqlite3 ~/.claude/slack/registry.db "SELECT * FROM sessions WHERE updated_at < datetime('now', '-24 hours');"
 ```
 
 ### Development Security

@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""
+Test script to post a 4-option notification to Slack.
+
+This demonstrates what a non-standard permission prompt looks like
+when it doesn't match the Yes/No or Yes/Yes,allow.../No patterns
+(no buttons, just numbered text options).
+
+Usage:
+    ./bin/test-4-option-notification [channel]
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
+
+from dotenv import load_dotenv
+
+# Load environment
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(env_path)
+
+
+def main():
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        print("Error: slack_sdk not installed. Run: pip install slack-sdk")
+        sys.exit(1)
+
+    bot_token = os.environ.get("SLACK_BOT_TOKEN")
+    if not bot_token:
+        print("Error: SLACK_BOT_TOKEN not set in .env")
+        sys.exit(1)
+
+    # Get channel from args or environment
+    channel = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SLACK_CHANNEL", "#claude-sessions")
+
+    client = WebClient(token=bot_token)
+
+    # Test message with 4 custom options (no buttons will be shown)
+    message = """⚠️ **Permission Required: AskUserQuestion**
+
+Claude is asking for user input with multiple options.
+
+**Question:** Which database should we use for the new feature?
+
+**Reply with:**
+1. PostgreSQL - Best for complex queries and ACID compliance
+2. MongoDB - Better for flexible schema and document storage
+3. SQLite - Simpler setup, good for single-user scenarios
+4. Redis - In-memory, best for caching and real-time data
+
+_Reply with 1, 2, 3, or 4 to respond_"""
+
+    try:
+        response = client.chat_postMessage(
+            channel=channel,
+            text=message,
+            mrkdwn=True
+        )
+        print(f"✅ Posted test notification to {channel}")
+        print(f"   Message timestamp: {response['ts']}")
+        print()
+        print("This is what a 4-option prompt looks like WITHOUT buttons.")
+        print("Notice: No interactive buttons, just numbered text options.")
+        print("User can reply with 1, 2, 3, or 4 as a text message.")
+
+    except SlackApiError as e:
+        print(f"Error posting to Slack: {e.response['error']}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

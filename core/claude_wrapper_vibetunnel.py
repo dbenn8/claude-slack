@@ -143,6 +143,10 @@ def run_vibetunnel_mode(wrapper):
                     import termios as term
                     import time
 
+                    # Normalize line endings - replace \n with \r for terminal input
+                    # This ensures multi-line messages are properly submitted
+                    slack_data = slack_data.replace(b'\n', b'\r')
+
                     # Step 1: Inject text bytes
                     for byte in slack_data:
                         fcntl.ioctl(sys.stdin, term.TIOCSTI, bytes([byte]))

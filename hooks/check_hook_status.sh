@@ -36,7 +36,7 @@ fi
 echo
 
 echo "3. Debug log file:"
-DEBUG_LOG="${STOP_HOOK_DEBUG_LOG:-/tmp/stop_hook_debug.log}"
+DEBUG_LOG="${STOP_HOOK_DEBUG_LOG:-$HOME/.claude/slack/logs/stop_hook_debug.log}"
 if [ -f "$DEBUG_LOG" ]; then
     echo "   ✓ Debug log exists"
     echo "   File size: $(wc -c < "$DEBUG_LOG") bytes"

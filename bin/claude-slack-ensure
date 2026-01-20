@@ -116,68 +116,89 @@ if [ "$REGISTRY_RUNNING" = false ]; then
     fi
 fi
 
-# Step 1: AGGRESSIVE MODE - Always kill and restart listener to ensure clean state
-# This prevents the scenario where listener is running from wrong location
-log "Ensuring clean Slack listener state..."
-echo -e "${YELLOW}Cleaning up existing listener processes...${NC}"
+# Step 1: Check if a healthy listener already exists
+log "Checking for existing Slack listener..."
 
-# Kill any existing listener processes (from any location)
-pkill -9 -f "slack_listener.py" 2>/dev/null || true
-sleep 2
-
-# Step 2: Start fresh listener from universal location
-log "Starting Slack listener from universal location..."
-
-# Check if start script exists
-if [ ! -f "${SCRIPT_DIR}/claude-slack-listener" ]; then
-    echo -e "${RED}✗ Error: claude-slack-listener not found${NC}"
-    exit 1
+LISTENER_RUNNING=false
+if pgrep -f "slack_listener.py" > /dev/null; then
+    LISTENER_RUNNING=true
+    log "Found existing listener process"
 fi
 
-# Run the startup script
-echo -e "${YELLOW}Starting Slack listener...${NC}"
-if ! "${SCRIPT_DIR}/claude-slack-listener"; then
-    echo -e "${RED}✗ Failed to start Slack listener${NC}"
-    log "✗ Failed to start Slack listener"
-    exit 1
-fi
-
-log "✓ Successfully started Slack listener"
-
-# Step 3: Wait for initialization
-log "Waiting for initialization..."
-sleep 3
-
-# Step 4: Verify health
-if [ ! -f "${SCRIPT_DIR}/claude-slack-health" ]; then
-    echo -e "${RED}✗ Error: claude-slack-health not found${NC}"
-    exit 1
-fi
-
-# Run health check with retries
-MAX_HEALTH_ATTEMPTS=5
-HEALTH_ATTEMPT=1
-
-while [ $HEALTH_ATTEMPT -le $MAX_HEALTH_ATTEMPTS ]; do
+# Step 2: If listener is running, check if it's healthy
+if [ "$LISTENER_RUNNING" = true ]; then
+    log "Testing listener health..."
     if "${SCRIPT_DIR}/claude-slack-health" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Slack listener is healthy${NC}"
-        log "✓ Health check passed on attempt $HEALTH_ATTEMPT"
-        break
-    fi
-
-    if [ $HEALTH_ATTEMPT -lt $MAX_HEALTH_ATTEMPTS ]; then
-        log "Health check attempt $HEALTH_ATTEMPT failed, retrying..."
+        echo -e "${GREEN}✓ Slack listener already running and healthy${NC}"
+        log "✓ Existing listener is healthy, no restart needed"
+        # Skip to monitor check (Step 5)
+        SKIP_LISTENER_START=true
+    else
+        echo -e "${YELLOW}Existing listener unhealthy, restarting...${NC}"
+        log "Existing listener unhealthy, will restart"
+        pkill -9 -f "slack_listener.py" 2>/dev/null || true
         sleep 2
+        SKIP_LISTENER_START=false
+    fi
+else
+    echo -e "${YELLOW}No listener running, starting one...${NC}"
+    log "No existing listener found"
+    SKIP_LISTENER_START=false
+fi
+
+# Step 3: Start listener if needed
+if [ "${SKIP_LISTENER_START:-false}" = false ]; then
+    log "Starting Slack listener..."
+
+    # Check if start script exists
+    if [ ! -f "${SCRIPT_DIR}/claude-slack-listener" ]; then
+        echo -e "${RED}✗ Error: claude-slack-listener not found${NC}"
+        exit 1
     fi
 
-    HEALTH_ATTEMPT=$((HEALTH_ATTEMPT + 1))
-done
+    # Run the startup script in daemon mode
+    if ! "${SCRIPT_DIR}/claude-slack-listener" --daemon; then
+        echo -e "${RED}✗ Failed to start Slack listener${NC}"
+        log "✗ Failed to start Slack listener"
+        exit 1
+    fi
 
-# Final health check
-if ! "${SCRIPT_DIR}/claude-slack-health" >/dev/null 2>&1; then
-    echo -e "${RED}✗ Slack listener failed health check after $MAX_HEALTH_ATTEMPTS attempts${NC}"
-    log "✗ Failed health check after $MAX_HEALTH_ATTEMPTS attempts"
-    exit 1
+    log "✓ Successfully started Slack listener"
+
+    # Step 4: Wait and verify health
+    log "Waiting for initialization..."
+    sleep 3
+
+    if [ ! -f "${SCRIPT_DIR}/claude-slack-health" ]; then
+        echo -e "${RED}✗ Error: claude-slack-health not found${NC}"
+        exit 1
+    fi
+
+    # Run health check with retries
+    MAX_HEALTH_ATTEMPTS=5
+    HEALTH_ATTEMPT=1
+
+    while [ $HEALTH_ATTEMPT -le $MAX_HEALTH_ATTEMPTS ]; do
+        if "${SCRIPT_DIR}/claude-slack-health" >/dev/null 2>&1; then
+            echo -e "${GREEN}✓ Slack listener is healthy${NC}"
+            log "✓ Health check passed on attempt $HEALTH_ATTEMPT"
+            break
+        fi
+
+        if [ $HEALTH_ATTEMPT -lt $MAX_HEALTH_ATTEMPTS ]; then
+            log "Health check attempt $HEALTH_ATTEMPT failed, retrying..."
+            sleep 2
+        fi
+
+        HEALTH_ATTEMPT=$((HEALTH_ATTEMPT + 1))
+    done
+
+    # Final health check
+    if ! "${SCRIPT_DIR}/claude-slack-health" >/dev/null 2>&1; then
+        echo -e "${RED}✗ Slack listener failed health check after $MAX_HEALTH_ATTEMPTS attempts${NC}"
+        log "✗ Failed health check after $MAX_HEALTH_ATTEMPTS attempts"
+        exit 1
+    fi
 fi
 
 # Step 5: Ensure monitor is running

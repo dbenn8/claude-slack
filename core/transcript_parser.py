@@ -34,6 +34,26 @@ class TranscriptParser:
         self.messages: List[Dict[str, Any]] = []
 
     @staticmethod
+    def _get_message_content(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Safely extract content list from a message.
+
+        Handles cases where 'message' might be a string instead of dict.
+
+        Args:
+            msg: Message dict from transcript
+
+        Returns:
+            List of content blocks, or empty list if not available
+        """
+        message_data = msg.get('message', {})
+        if isinstance(message_data, dict):
+            content = message_data.get('content', [])
+            if isinstance(content, list):
+                return content
+        return []
+
+    @staticmethod
     def get_transcript_path_from_env() -> Optional[str]:
         """
         Get transcript path from environment variables (set by Claude Code hooks).
@@ -143,13 +163,15 @@ class TranscriptParser:
         # Get the last assistant message
         latest = assistant_messages[-1]
         message_data = latest.get('message', {})
-        content = message_data.get('content', [])
+        if not isinstance(message_data, dict):
+            message_data = {}
+        content = self._get_message_content(latest)
 
         # Extract text blocks
         text_blocks = [
             c.get('text', '')
             for c in content
-            if c.get('type') == 'text' and c.get('text', '').strip()
+            if isinstance(c, dict) and c.get('type') == 'text' and c.get('text', '').strip()
         ]
 
         # If text_only mode and no text, return None
@@ -196,6 +218,217 @@ class TranscriptParser:
             'user_messages': user_count,
             'assistant_messages': assistant_count,
             'session_id': self.messages[0].get('sessionId') if self.messages else None,
+        }
+
+    def get_all_tool_calls(self) -> List[Dict[str, Any]]:
+        """
+        Get all tool calls from the conversation.
+
+        Returns:
+            List of tool call dicts with name, input, and result
+        """
+        tool_calls = []
+
+        for msg in self.messages:
+            if msg.get('type') == 'assistant':
+                content = self._get_message_content(msg)
+                for c in content:
+                    if isinstance(c, dict) and c.get('type') == 'tool_use':
+                        tool_calls.append({
+                            'name': c.get('name'),
+                            'id': c.get('id'),
+                            'input': c.get('input', {}),
+                            'timestamp': msg.get('timestamp')
+                        })
+            elif msg.get('type') == 'tool_result':
+                # Match result to tool call
+                tool_use_id = msg.get('tool_use_id')
+                for tc in tool_calls:
+                    if tc.get('id') == tool_use_id:
+                        tc['result'] = msg.get('content')
+                        tc['is_error'] = msg.get('is_error', False)
+                        break
+
+        return tool_calls
+
+    def get_todo_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the latest todo list status from TodoWrite calls.
+
+        Returns:
+            Dict with todos list and counts, or None if no todos
+        """
+        tool_calls = self.get_all_tool_calls()
+
+        # Find the last TodoWrite call
+        todo_calls = [tc for tc in tool_calls if tc.get('name') == 'TodoWrite']
+
+        if not todo_calls:
+            return None
+
+        latest_todo = todo_calls[-1]
+        todos = latest_todo.get('input', {}).get('todos', [])
+
+        completed = [t for t in todos if t.get('status') == 'completed']
+        in_progress = [t for t in todos if t.get('status') == 'in_progress']
+        pending = [t for t in todos if t.get('status') == 'pending']
+
+        return {
+            'todos': todos,
+            'total': len(todos),
+            'completed': len(completed),
+            'in_progress': len(in_progress),
+            'pending': len(pending),
+            'completed_items': [t.get('content') for t in completed],
+            'in_progress_items': [t.get('content') for t in in_progress],
+            'pending_items': [t.get('content') for t in pending],
+            'is_complete': len(pending) == 0 and len(in_progress) == 0
+        }
+
+    def get_modified_files(self) -> List[str]:
+        """
+        Get list of files that were modified (via Edit or Write).
+
+        Returns:
+            List of unique file paths that were modified
+        """
+        tool_calls = self.get_all_tool_calls()
+
+        files = set()
+        for tc in tool_calls:
+            name = tc.get('name')
+            input_data = tc.get('input', {})
+
+            if name == 'Edit':
+                file_path = input_data.get('file_path')
+                if file_path:
+                    files.add(file_path)
+            elif name == 'Write':
+                file_path = input_data.get('file_path')
+                if file_path:
+                    files.add(file_path)
+
+        return sorted(list(files))
+
+    def get_last_n_messages(self, n: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get the last N messages from the transcript for DM history.
+
+        Args:
+            n: Number of messages to return (default: 5, min: 1, max: 25)
+
+        Returns:
+            List of messages formatted for Slack:
+            [{'role': 'user'/'assistant', 'text': str, 'timestamp': str}, ...]
+            Messages are in chronological order (oldest first).
+        """
+        # Validate and clamp n
+        n = max(1, min(25, n))
+
+        # Get user and assistant messages (skip tool_result)
+        relevant_messages = [
+            msg for msg in self.messages
+            if msg.get('type') in ('user', 'assistant')
+        ]
+
+        # Take last n messages
+        last_n = relevant_messages[-n:] if relevant_messages else []
+
+        # Format for Slack
+        formatted = []
+        for msg in last_n:
+            role = msg.get('type')
+            timestamp = msg.get('timestamp', '')
+
+            # Extract text content
+            content = self._get_message_content(msg)
+            text_parts = [
+                c.get('text', '')
+                for c in content
+                if isinstance(c, dict) and c.get('type') == 'text'
+            ]
+            text = '\n'.join(text_parts).strip()
+
+            if text:  # Only include messages with actual text
+                formatted.append({
+                    'role': role,
+                    'text': text,
+                    'timestamp': timestamp
+                })
+
+        return formatted
+
+    def get_stop_reason(self) -> str:
+        """
+        Determine the stop reason from the transcript.
+
+        Returns:
+            One of: 'completed', 'interrupted', 'error', 'unknown'
+        """
+        if not self.messages:
+            return 'unknown'
+
+        # Check last message for clues
+        last_msg = self.messages[-1]
+
+        # If last message is assistant with text, likely completed
+        if last_msg.get('type') == 'assistant':
+            content = self._get_message_content(last_msg)
+            has_text = any(isinstance(c, dict) and c.get('type') == 'text' for c in content)
+            if has_text:
+                return 'completed'
+
+        # If last message is tool_result with error, might be error
+        if last_msg.get('type') == 'tool_result' and last_msg.get('is_error'):
+            return 'error'
+
+        # Check if there are pending todos
+        todo_status = self.get_todo_status()
+        if todo_status and not todo_status.get('is_complete'):
+            return 'interrupted'
+
+        return 'completed'
+
+    def get_rich_summary(self) -> Dict[str, Any]:
+        """
+        Generate a rich summary of the session for Slack.
+
+        Returns:
+            Dict with all summary information
+        """
+        conv_summary = self.get_conversation_summary()
+        todo_status = self.get_todo_status()
+        modified_files = self.get_modified_files()
+        stop_reason = self.get_stop_reason()
+        latest_response = self.get_latest_assistant_response(text_only=False)
+
+        # Get first user message as "task"
+        user_messages = [m for m in self.messages if m.get('type') == 'user']
+        initial_task = None
+        if user_messages:
+            first_user = user_messages[0]
+            message_data = first_user.get('message', {})
+            # Handle case where message might be a string instead of dict
+            if isinstance(message_data, dict):
+                content = message_data.get('content', [])
+            else:
+                content = []
+            for c in content:
+                if isinstance(c, dict) and c.get('type') == 'text':
+                    initial_task = c.get('text', '')[:200]  # First 200 chars
+                    if len(c.get('text', '')) > 200:
+                        initial_task += '...'
+                    break
+
+        return {
+            'stop_reason': stop_reason,
+            'is_complete': stop_reason == 'completed' and (not todo_status or todo_status.get('is_complete', True)),
+            'initial_task': initial_task,
+            'conversation': conv_summary,
+            'todos': todo_status,
+            'modified_files': modified_files,
+            'model': latest_response.get('model') if latest_response else None,
+            'usage': latest_response.get('usage') if latest_response else None,
         }
 
 

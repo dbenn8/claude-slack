@@ -1,0 +1,114 @@
+# Claude Code Bot - Slack App Manifest
+#
+# This manifest configures the Slack app for bidirectional communication
+# with Claude Code terminal sessions.
+#
+# PERMISSION TIERS:
+#   Minimum (Basic): Core functionality - posting messages, reading responses
+#   Recommended (Full): Auto-channel creation, joining channels automatically
+#
+# To use this manifest:
+#   1. Go to https://api.slack.com/apps
+#   2. Click "Create New App" → "From an app manifest"
+#   3. Paste this file contents
+#   4. Install to your workspace
+
+display_information:
+  name: Claude Code Bot
+  description: Bidirectional communication with Claude Code sessions
+  background_color: "#000000"
+
+features:
+  bot_user:
+    display_name: Claude Code Bot
+    always_online: true
+
+  # Global shortcuts - accessible from Slack's ⚡ menu anywhere
+  shortcuts:
+    - name: Get Sessions
+      type: global
+      callback_id: get_sessions
+      description: List active Claude Code sessions
+
+    - name: Attach to Session
+      type: global
+      callback_id: attach_to_session
+      description: Subscribe to a session's output in your DMs
+
+    - name: Research Mode
+      type: global
+      callback_id: research_mode
+      description: Set mode to read-only exploration (no code changes)
+
+    - name: Plan Mode
+      type: global
+      callback_id: plan_mode
+      description: Set mode to design approach (no implementation)
+
+    - name: Execute Mode
+      type: global
+      callback_id: execute_mode
+      description: Set mode to implement changes (default)
+
+oauth_config:
+  scopes:
+    bot:
+      # ============================================
+      # MINIMUM REQUIRED SCOPES (Basic Functionality)
+      # ============================================
+      # These are required for the integration to work at all.
+      # Without these, the bot cannot communicate.
+
+      - app_mentions:read      # Receive @mentions of the bot
+      - channels:history       # Read messages in public channels (for threaded replies)
+      - channels:read          # List channels and get channel info
+      - chat:write             # Post messages to channels the bot is in
+      - reactions:read         # Read emoji reactions (for quick permission responses)
+      - reactions:write        # Add emoji reactions to messages
+      - users:read             # Get user info for displaying names
+
+      # ============================================
+      # RECOMMENDED SCOPES (Enhanced Functionality)
+      # ============================================
+      # These enable additional features but aren't strictly required.
+      # The integration works without them, just with reduced features.
+
+      # Auto-channel creation & joining (skip manual channel setup)
+      - channels:join          # Bot can join public channels automatically
+      - channels:manage        # Create new channels when using -c flag
+
+      # Post to any public channel without being invited first
+      - chat:write.public      # Write to channels without joining
+
+      # Private channel support
+      - groups:history         # Read messages in private channels
+      - groups:read            # List and get info on private channels
+
+      # Direct message support
+      - im:history             # Read DM history
+      - im:read                # List DMs
+      - im:write               # Send DMs to users
+
+      # Multi-party DM support
+      - mpim:history           # Read group DM history
+      - mpim:read              # List group DMs
+
+settings:
+  event_subscriptions:
+    bot_events:
+      # Message events (required for receiving user input)
+      - app_mention            # When someone @mentions the bot
+      - message.channels       # Messages in public channels
+      - message.groups         # Messages in private channels
+      - message.im             # Direct messages
+      - message.mpim           # Group direct messages
+
+      # Reaction events (for quick permission responses via emoji)
+      - reaction_added         # When someone adds a reaction
+
+  interactivity:
+    is_enabled: true           # Required for interactive permission buttons
+
+  org_deploy_enabled: false    # Not needed for personal/team use
+  socket_mode_enabled: true    # Required - uses WebSocket instead of webhooks
+  token_rotation_enabled: false

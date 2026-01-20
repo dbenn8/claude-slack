@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude Slack Listener
+After=network-online.target
+Wants=network-online.target
+# Limit restart attempts to avoid spinning
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.claude/claude-slack/.venv/bin/python3 %h/.claude/claude-slack/core/slack_listener.py
+WorkingDirectory=%h/.claude/claude-slack
+EnvironmentFile=%h/.claude/claude-slack/.env
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.claude/slack %h/.claude/claude-slack
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

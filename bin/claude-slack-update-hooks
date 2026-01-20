@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+Claude-Slack Hook Updater
+
+Updates hooks in .claude/hooks/ from the source hooks/ directory.
+Handles version checking, backup of customized hooks, and safe updates.
+
+Usage:
+    claude-slack-update-hooks          # Interactive update
+    claude-slack-update-hooks --force  # Update all hooks (backup customized)
+    claude-slack-update-hooks --check  # Check for updates without applying
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Find the claude-slack directory
+SCRIPT_DIR = Path(__file__).parent
+CLAUDE_SLACK_DIR = SCRIPT_DIR.parent
+
+# Hook directories
+SOURCE_HOOKS_DIR = CLAUDE_SLACK_DIR / "hooks"
+TARGET_HOOKS_DIR = CLAUDE_SLACK_DIR / ".claude" / "hooks"
+BACKUP_DIR = TARGET_HOOKS_DIR / "backup"
+
+# Hooks to manage (source filename -> target filename)
+MANAGED_HOOKS = {
+    "on_notification.py": "on_notification.py",
+    "on_stop.py": "on_stop.py",
+    "on_pretooluse.py": "on_pretooluse.py",
+}
+
+# Add on_posttooluse if it exists in source
+if (SOURCE_HOOKS_DIR / "on_posttooluse.py").exists():
+    MANAGED_HOOKS["on_posttooluse.py"] = "on_posttooluse.py"
+elif (CLAUDE_SLACK_DIR / ".claude" / "hooks" / "on_posttooluse.py").exists():
+    # on_posttooluse is only in .claude/hooks currently
+    pass
+
+
+def get_file_hash(filepath: Path) -> str:
+    """Get SHA256 hash of a file."""
+    if not filepath.exists():
+        return ""
+    with open(filepath, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def get_hook_version(filepath: Path) -> str:
+    """Extract HOOK_VERSION from a hook file."""
+    if not filepath.exists():
+        return "0.0.0"
+
+    try:
+        content = filepath.read_text()
+        match = re.search(r'HOOK_VERSION\s*=\s*["\']([^"\']+)["\']', content)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
+    return "0.0.0"
+
+
+def parse_version(version: str) -> tuple:
+    """Parse version string into comparable tuple."""
+    try:
+        parts = version.split(".")
+        return tuple(int(p) for p in parts)
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def version_greater(v1: str, v2: str) -> bool:
+    """Check if v1 > v2."""
+    return parse_version(v1) > parse_version(v2)
+
+
+def backup_hook(hook_path: Path) -> Path:
+    """Backup a hook file with timestamp."""
+    if not hook_path.exists():
+        return None
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"{hook_path.stem}_{timestamp}{hook_path.suffix}"
+    backup_path = BACKUP_DIR / backup_name
+
+    shutil.copy2(hook_path, backup_path)
+    return backup_path
+
+
+def check_hooks() -> list:
+    """Check all hooks for available updates.
+
+    Returns list of dicts with hook info.
+    """
+    results = []
+
+    for source_name, target_name in MANAGED_HOOKS.items():
+        source_path = SOURCE_HOOKS_DIR / source_name
+        target_path = TARGET_HOOKS_DIR / target_name
+
+        if not source_path.exists():
+            continue
+
+        source_version = get_hook_version(source_path)
+        target_version = get_hook_version(target_path)
+
+        source_hash = get_file_hash(source_path)
+        target_hash = get_file_hash(target_path)
+
+        needs_update = version_greater(source_version, target_version)
+        is_customized = target_path.exists() and source_hash != target_hash and not needs_update
+        is_missing = not target_path.exists()
+
+        results.append({
+            "name": source_name,
+            "source_path": source_path,
+            "target_path": target_path,
+            "source_version": source_version,
+            "target_version": target_version,
+            "needs_update": needs_update or is_missing,
+            "is_customized": is_customized,
+            "is_missing": is_missing,
+        })
+
+    return results
+
+
+def update_hook(hook_info: dict, force: bool = False) -> dict:
+    """Update a single hook.
+
+    Returns dict with result info.
+    """
+    source_path = hook_info["source_path"]
+    target_path = hook_info["target_path"]
+
+    result = {
+        "name": hook_info["name"],
+        "action": None,
+        "backup_path": None,
+        "error": None,
+    }
+
+    try:
+        # Create target directory if needed
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if hook_info["is_missing"]:
+            # New hook, just copy
+            shutil.copy2(source_path, target_path)
+            result["action"] = "installed"
+
+        elif hook_info["needs_update"]:
+            if hook_info["is_customized"] or force:
+                # Backup customized hook before updating
+                backup_path = backup_hook(target_path)
+                result["backup_path"] = backup_path
+
+            shutil.copy2(source_path, target_path)
+            result["action"] = "updated"
+
+        else:
+            result["action"] = "skipped"
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["action"] = "error"
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Update Claude-Slack hooks safely"
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force update all hooks (backups customized hooks)"
+    )
+    parser.add_argument(
+        "--check", "-c",
+        action="store_true",
+        help="Check for updates without applying"
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Minimal output"
+    )
+
+    args = parser.parse_args()
+
+    # Check for updates
+    hooks = check_hooks()
+
+    if not hooks:
+        if not args.quiet:
+            print("No managed hooks found.")
+        return 0
+
+    # Display status
+    if not args.quiet:
+        print("Hook Status:")
+        print("-" * 60)
+
+    updates_available = []
+    customized = []
+
+    for hook in hooks:
+        status_parts = []
+
+        if hook["is_missing"]:
+            status_parts.append("MISSING")
+            updates_available.append(hook)
+        elif hook["needs_update"]:
+            status_parts.append(f"UPDATE AVAILABLE ({hook['target_version']} -> {hook['source_version']})")
+            updates_available.append(hook)
+            if hook["is_customized"]:
+                status_parts.append("CUSTOMIZED")
+                customized.append(hook)
+        elif hook["is_customized"]:
+            status_parts.append("CUSTOMIZED (same version)")
+            customized.append(hook)
+        else:
+            status_parts.append(f"OK (v{hook['target_version']})")
+
+        if not args.quiet:
+            print(f"  {hook['name']}: {', '.join(status_parts)}")
+
+    if not args.quiet:
+        print("-" * 60)
+
+    # Check-only mode
+    if args.check:
+        if updates_available:
+            print(f"\n{len(updates_available)} update(s) available.")
+            if customized:
+                print(f"{len(customized)} hook(s) have local customizations (will be backed up).")
+            print("\nRun 'claude-slack-update-hooks' to apply updates.")
+            return 1
+        else:
+            print("\nAll hooks are up to date.")
+            return 0
+
+    # No updates needed
+    if not updates_available and not args.force:
+        if not args.quiet:
+            print("\nAll hooks are up to date.")
+        return 0
+
+    # Confirm if there are customized hooks
+    if customized and not args.force:
+        print(f"\nWarning: {len(customized)} hook(s) have local customizations:")
+        for hook in customized:
+            print(f"  - {hook['name']}")
+        print("\nThese will be backed up before updating.")
+
+        try:
+            response = input("Continue? [y/N]: ").strip().lower()
+            if response != 'y':
+                print("Aborted.")
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 1
+
+    # Apply updates
+    if not args.quiet:
+        print("\nUpdating hooks...")
+
+    results = []
+    for hook in hooks:
+        if hook["needs_update"] or hook["is_missing"] or args.force:
+            result = update_hook(hook, force=args.force)
+            results.append(result)
+
+            if not args.quiet:
+                if result["action"] == "installed":
+                    print(f"  {result['name']}: Installed (v{hook['source_version']})")
+                elif result["action"] == "updated":
+                    msg = f"  {result['name']}: Updated ({hook['target_version']} -> {hook['source_version']})"
+                    if result["backup_path"]:
+                        msg += f"\n    Backup: {result['backup_path']}"
+                    print(msg)
+                elif result["action"] == "error":
+                    print(f"  {result['name']}: ERROR - {result['error']}")
+
+    # Summary
+    installed = sum(1 for r in results if r["action"] == "installed")
+    updated = sum(1 for r in results if r["action"] == "updated")
+    errors = sum(1 for r in results if r["action"] == "error")
+
+    if not args.quiet:
+        print(f"\nDone: {installed} installed, {updated} updated, {errors} errors")
+
+    if errors > 0:
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

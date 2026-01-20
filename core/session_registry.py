@@ -128,6 +128,10 @@ class SessionRegistry:
         self.socket_path = socket_path
         self.slack_channel = slack_channel
 
+        # Create directories BEFORE initializing database
+        self.registry_dir.mkdir(parents=True, exist_ok=True)
+        Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
+
         # Database backend (replaces JSON file + manual locking)
         db_path = self.registry_dir / "registry.db"
         self.db = RegistryDatabase(str(db_path))
@@ -151,10 +155,6 @@ class SessionRegistry:
         self.server_thread = None
         self.running = False
 
-        # Create directories
-        self.registry_dir.mkdir(parents=True, exist_ok=True)
-        Path(socket_path).parent.mkdir(parents=True, exist_ok=True)
-
         self._initialized = True
 
         # Log existing sessions count
@@ -164,7 +164,16 @@ class SessionRegistry:
     def _log(self, message: str):
         """Log message with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[Registry {timestamp}] {message}", file=sys.stderr)
+        log_line = f"[Registry {timestamp}] {message}"
+        print(log_line, file=sys.stderr)
+        # Also write to file for debugging
+        log_file = os.path.expanduser("~/.claude/slack/logs/session_registry.log")
+        try:
+            with open(log_file, "a") as f:
+                f.write(log_line + "\n")
+                f.flush()
+        except Exception:
+            pass
 
     def register_session(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -210,6 +219,8 @@ class SessionRegistry:
             def create_thread_async():
                 try:
                     self._log(f"[Async] Creating Slack thread for {session_id}")
+                    self._log(f"[Async] session_data keys: {list(session_data.keys())}")
+                    self._log(f"[Async] custom_channel in session_data: {session_data.get('custom_channel')}")
                     thread_data = self._create_slack_thread(session_data)
 
                     # Update session with thread info (atomic database update)
@@ -332,6 +343,40 @@ class SessionRegistry:
         """
         return self.db.list_sessions(status)
 
+    def deactivate_session(self, session_id: str) -> bool:
+        """
+        Mark a session as inactive (called during cleanup).
+
+        Unlike unregister_session, this preserves the session record for
+        history/debugging but marks it as no longer active.
+
+        Args:
+            session_id: Session identifier
+
+        Returns:
+            True if session was deactivated, False if not found
+        """
+        session = self.db.get_session(session_id)
+        if not session:
+            self._log(f"Session not found for deactivation: {session_id}")
+            return False
+
+        # Mark as inactive
+        self.db.update_session(session_id, {'status': 'inactive'})
+        self._log(f"Session {session_id} marked as inactive")
+
+        # Post a closing message to Slack thread if available
+        if self.slack_client and session.get("thread_ts") and session.get("channel"):
+            try:
+                self.slack_client.chat_postMessage(
+                    channel=session.get("channel"),
+                    thread_ts=session.get("thread_ts"),
+                    text="🔚 Session ended"
+                )
+            except Exception as e:
+                self._log(f"Failed to post session end message: {e}")
+
+        return True
 
     def get_by_thread(self, thread_ts: str) -> Optional[Dict[str, Any]]:
         """
@@ -575,28 +620,30 @@ class SessionRegistry:
                 return {"success": True, "session": session}
 
             elif command == "REGISTER_EXISTING":
-                # Register a new session ID pointing to an existing Slack thread
-                # Used to register Claude's UUID with the same thread as the wrapper
+                # Register a new session ID pointing to an existing Slack channel/thread
+                # Used to register Claude's UUID with the same Slack metadata as the wrapper
                 self._log(f"Processing REGISTER_EXISTING command for {data.get('session_id', 'unknown')}")
                 session_id = data.get("session_id")
-                thread_ts = data.get("thread_ts")
+                thread_ts = data.get("thread_ts")  # May be None for custom channel mode
                 channel = data.get("channel")
 
-                if not session_id or not thread_ts or not channel:
-                    return {"success": False, "error": "Missing required fields: session_id, thread_ts, channel"}
+                # Only require session_id and channel (thread_ts can be None for custom channels)
+                if not session_id or not channel:
+                    return {"success": False, "error": "Missing required fields: session_id, channel"}
 
                 # Create session with existing Slack metadata
                 session_data = {
                     'session_id': session_id,
                     'project': data.get("project", "Unknown"),
+                    'project_dir': data.get("project_dir"),
                     'terminal': data.get("terminal", "Unknown"),
                     'socket_path': data.get("socket_path", ""),
-                    'thread_ts': thread_ts,  # Note: create_session expects 'thread_ts' not 'slack_thread_ts'
-                    'channel': channel,       # Note: create_session expects 'channel' not 'slack_channel'
+                    'thread_ts': thread_ts,  # May be None for custom channel mode
+                    'channel': channel,
                     'slack_user_id': data.get("slack_user_id")
                 }
                 session = self.db.create_session(session_data)
-                self._log(f"REGISTER_EXISTING completed for {session_id} -> thread {thread_ts}")
+                self._log(f"REGISTER_EXISTING completed for {session_id} -> channel {channel}, thread {thread_ts}")
                 return {"success": True, "session": session}
 
             elif command == "UNREGISTER":
@@ -618,6 +665,16 @@ class SessionRegistry:
                 sessions = self.list_sessions(status)
                 return {"success": True, "sessions": sessions}
 
+            elif command == "UPDATE":
+                session_id = data.get("session_id")
+                updates = data.get("updates", {})
+                if not session_id:
+                    return {"success": False, "error": "session_id is required"}
+                if not updates:
+                    return {"success": False, "error": "updates dict is required"}
+                self.db.update_session(session_id, updates)
+                return {"success": True, "session_id": session_id}
+
             else:
                 return {"success": False, "error": f"Unknown command: {command}"}
 
@@ -628,15 +685,236 @@ class SessionRegistry:
     # Slack Integration
     # ========================================
 
+    def _ensure_channel_exists(self, channel_name: str) -> str:
+        """
+        Ensure a Slack channel exists, creating it if necessary.
+
+        Args:
+            channel_name: Channel name (without # prefix)
+
+        Returns:
+            Channel ID (e.g., "C0123456789")
+
+        Raises:
+            RuntimeError: If channel creation fails
+        """
+        if not self.slack_client:
+            raise RuntimeError("Slack client not initialized")
+
+        # Normalize channel name (strip # prefix, lowercase, replace spaces with hyphens)
+        channel_name = channel_name.lstrip('#').lower().replace(' ', '-')
+
+        self._log(f"Ensuring channel exists: {channel_name}")
+
+        try:
+            # First, try to find existing channel by name
+            # Use conversations.list to search for the channel
+            cursor = None
+            max_pages = 50  # Safety limit to prevent infinite loops
+            page_count = 0
+
+            while page_count < max_pages:
+                page_count += 1
+
+                if cursor:
+                    response = self.slack_client.conversations_list(
+                        types="public_channel,private_channel",
+                        limit=200,
+                        cursor=cursor
+                    )
+                else:
+                    response = self.slack_client.conversations_list(
+                        types="public_channel,private_channel",
+                        limit=200
+                    )
+
+                # Validate response is dict-like (SlackResponse is not a dict but has .get())
+                # Check for dict-like interface rather than strict isinstance(response, dict)
+                if not hasattr(response, 'get') or not callable(getattr(response, 'get', None)):
+                    self._log(f"Warning: Unexpected response type from conversations_list: {type(response)}")
+                    break
+
+                channels = response.get('channels', [])
+                if not isinstance(channels, list):
+                    self._log(f"Warning: Unexpected channels type: {type(channels)}")
+                    break
+
+                for channel in channels:
+                    if not isinstance(channel, dict):
+                        continue
+                    if channel.get('name') == channel_name:
+                        channel_id = channel.get('id')
+                        if not channel_id:
+                            continue
+                        self._log(f"Found existing channel: {channel_name} ({channel_id})")
+
+                        # Ensure bot is a member
+                        if not channel.get('is_member', False):
+                            try:
+                                self.slack_client.conversations_join(channel=channel_id)
+                                self._log(f"Joined channel: {channel_name}")
+                            except Exception as e:
+                                self._log(f"Warning: Could not join channel {channel_name}: {e}")
+
+                        return channel_id
+
+                # Check for pagination - must be a non-empty string
+                response_metadata = response.get('response_metadata')
+                if response_metadata and hasattr(response_metadata, 'get'):
+                    next_cursor = response_metadata.get('next_cursor')
+                    if isinstance(next_cursor, str) and next_cursor:
+                        cursor = next_cursor
+                        continue
+
+                # No more pages
+                break
+
+            if page_count >= max_pages:
+                self._log(f"Warning: Hit pagination limit ({max_pages} pages) searching for channel {channel_name}")
+
+            # Channel doesn't exist, create it
+            self._log(f"Channel {channel_name} not found, creating it...")
+            create_response = self.slack_client.conversations_create(
+                name=channel_name,
+                is_private=False
+            )
+
+            channel_id = create_response['channel']['id']
+            self._log(f"Created new channel: {channel_name} ({channel_id})")
+
+            # Post notification in default channel about the new channel
+            try:
+                self.slack_client.chat_postMessage(
+                    channel=self.slack_channel,
+                    text=f"📢 New Claude session channel created: <#{channel_id}|{channel_name}>",
+                    blocks=[
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"📢 *New Claude session channel created*\n\nClick to join: <#{channel_id}|{channel_name}>"
+                            }
+                        }
+                    ]
+                )
+                self._log(f"Posted notification about new channel to {self.slack_channel}")
+            except Exception as notify_err:
+                self._log(f"Warning: Could not post notification: {notify_err}")
+
+            return channel_id
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Handle specific error cases with helpful messages
+            if 'name_taken' in error_msg:
+                # Channel exists but we couldn't find it (maybe private or archived)
+                self._log(f"Channel {channel_name} exists but not visible, trying to join...")
+                try:
+                    join_response = self.slack_client.conversations_join(channel=channel_name)
+                    return join_response['channel']['id']
+                except Exception as join_error:
+                    raise RuntimeError(
+                        f"Channel '{channel_name}' exists but bot cannot join it. "
+                        f"Either invite the bot manually (/invite @Claude Code Bot) or "
+                        f"ensure the bot has 'channels:join' scope."
+                    )
+            elif 'missing_scope' in error_msg or 'not_allowed' in error_msg:
+                # Determine which scope is missing based on context
+                if 'conversations.create' in error_msg or 'channels:manage' in error_msg:
+                    raise RuntimeError(
+                        f"Cannot auto-create channel '{channel_name}'. "
+                        f"Add 'channels:manage' scope to your Slack app, or create the channel manually "
+                        f"and invite the bot with: /invite @Claude Code Bot"
+                    )
+                elif 'conversations.join' in error_msg or 'channels:join' in error_msg:
+                    raise RuntimeError(
+                        f"Cannot auto-join channel '{channel_name}'. "
+                        f"Add 'channels:join' scope to your Slack app, or invite the bot manually: "
+                        f"/invite @Claude Code Bot"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Missing Slack permission for channel '{channel_name}'. "
+                        f"Check your Slack app scopes or create/join the channel manually. "
+                        f"Error: {e}"
+                    )
+            elif 'channel_not_found' in error_msg:
+                raise RuntimeError(
+                    f"Channel '{channel_name}' not found and cannot be created. "
+                    f"Either add 'channels:manage' scope to auto-create, or create the channel manually."
+                )
+            elif 'invalid_name' in error_msg:
+                raise RuntimeError(
+                    f"Invalid channel name '{channel_name}'. "
+                    f"Channel names must be lowercase, max 80 chars, using only letters, numbers, hyphens, and underscores."
+                )
+            else:
+                raise RuntimeError(f"Failed to setup channel '{channel_name}': {e}")
+
     def _create_slack_thread(self, session_data: Dict[str, Any]) -> Dict[str, str]:
         """
         Create Slack thread for new session (simplified for hooks-based system)
 
+        For custom channels: No parent thread - messages go as top-level posts
+        For default channel: Creates a parent thread message
+
+        Args:
+            session_data: Session data dict, may include:
+                - custom_channel: Override channel for this session (uses top-level messages)
+                - permissions_channel: Separate channel for permission prompts
+                - description/user_label: Optional description for thread
+
         Returns:
-            {"thread_ts": "...", "channel": "..."}
+            {"slack_thread_ts": "...", "slack_channel": "...", "permissions_channel": "..."}
         """
         if not self.slack_client:
             raise RuntimeError("Slack client not initialized")
+
+        # Determine which channel to use (custom_channel overrides default)
+        custom_channel = session_data.get('custom_channel')
+        target_channel = custom_channel or self.slack_channel
+        permissions_channel = session_data.get('permissions_channel')
+
+        # Normalize channel names (strip # prefix if present)
+        if target_channel.startswith('#'):
+            target_channel = target_channel[1:]
+        if permissions_channel and permissions_channel.startswith('#'):
+            permissions_channel = permissions_channel[1:]
+
+        self._log(f"Creating Slack thread in channel: {target_channel}")
+        if permissions_channel:
+            self._log(f"Permissions channel: {permissions_channel}")
+
+        # Ensure channels exist (creates if needed, joins if not a member)
+        # Channel ID is required - channel names won't work with Slack API
+        try:
+            target_channel_id = self._ensure_channel_exists(target_channel)
+            self._log(f"Target channel ID: {target_channel_id}")
+        except Exception as e:
+            self._log(f"Error: Could not resolve channel '{target_channel}' to ID: {e}")
+            raise RuntimeError(f"Could not resolve channel '{target_channel}' to ID: {e}")
+
+        if permissions_channel:
+            try:
+                permissions_channel_id = self._ensure_channel_exists(permissions_channel)
+                self._log(f"Permissions channel ID: {permissions_channel_id}")
+                permissions_channel = permissions_channel_id
+            except Exception as e:
+                self._log(f"Error: Could not resolve permissions channel '{permissions_channel}' to ID: {e}")
+                raise RuntimeError(f"Could not resolve permissions channel '{permissions_channel}' to ID: {e}")
+
+        # For custom channels, use top-level messages (no parent thread)
+        if custom_channel:
+            self._log(f"Custom channel mode: using top-level messages (no thread)")
+            # Just return the channel info, no thread_ts
+            return {
+                "slack_thread_ts": None,  # No threading for custom channels
+                "slack_channel": target_channel_id,
+                "permissions_channel": permissions_channel
+            }
+
+        # Get optional description
+        description = session_data.get('description') or session_data.get('user_label')
 
         # Create simple parent message in channel (no status tracking)
         blocks = [
@@ -646,31 +924,49 @@ class SessionRegistry:
                     "type": "plain_text",
                     "text": f"🚀 {session_data.get('project', 'Unknown')}"
                 }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Session:* `{session_data['session_id'][:12]}...`"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
-                    }
-                ]
             }
         ]
 
+        # Add description if provided
+        if description:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"_{description}_"
+                }
+            })
+
+        # Add session metadata
+        blocks.append({
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Session:* `{session_data['session_id'][:12]}...`"
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Terminal:* {session_data.get('terminal', 'Unknown')}"
+                }
+            ]
+        })
+
+        # Build text fallback
+        text_fallback = f"New Session: {session_data.get('project', 'Unknown')}"
+        if description:
+            text_fallback += f" - {description}"
+
         response = self.slack_client.chat_postMessage(
-            channel=self.slack_channel,
-            text=f"New Session: {session_data.get('project', 'Unknown')}",
+            channel=target_channel_id,
+            text=text_fallback,
             blocks=blocks
         )
 
         return {
             "slack_thread_ts": response["ts"],
-            "slack_channel": response["channel"]
+            "slack_channel": response["channel"],
+            "permissions_channel": permissions_channel
         }
 
     def _archive_slack_thread(self, session: Dict[str, Any]):

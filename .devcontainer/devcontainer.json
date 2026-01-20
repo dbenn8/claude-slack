@@ -1,0 +1,33 @@
+{
+  "name": "claude-slack",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      "BASE_IMAGE": "${localEnv:DEVCONTAINER_BASE:debian}"
+    }
+  },
+  "remoteUser": "developer",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"],
+        "python.defaultInterpreterPath": "/home/developer/.venv/bin/python"
+      }
+    }
+  },
+  "postCreateCommand": "pip install -r requirements.txt -r requirements-dev.txt",
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/developer/.claude,type=bind,consistency=cached"
+  ],
+  "containerEnv": {
+    "PYTHONPATH": "${containerWorkspaceFolder}/core"
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+}
