@@ -750,7 +750,13 @@ class HybridPTYWrapper:
                             self.logger.info("Input queued for VibeTunnel mode")
                         else:
                             # Standard mode - write to PTY
-                            bytes_written = os.write(self.master_fd, data.encode('utf-8'))
+                            # Sanitize newlines: Claude Code enters multi-line input mode
+                            # when it receives embedded newlines, causing the final \r to NOT
+                            # submit. Replace newlines with spaces so pasted content submits.
+                            sanitized = data.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+                            if sanitized != data:
+                                self.logger.info(f"Sanitized newlines in input ({len(data)} -> {len(sanitized)} chars)")
+                            bytes_written = os.write(self.master_fd, sanitized.encode('utf-8'))
                             self.logger.debug(f"Wrote {bytes_written} bytes to PTY master")
                             time.sleep(0.1)
                             os.write(self.master_fd, b'\r')
