@@ -147,9 +147,20 @@ echo -e "${BLUE}Waiting for services to stabilize...${NC}"
 sleep 2
 
 # Step 4: Launch Claude with the hybrid wrapper
-echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
-echo ""
-
-# Pass all arguments through to the Python wrapper
 cd "$PROJECT_DIR"
-exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+
+# Ensure we're inside a VibeTunnel session for full terminal visibility.
+# If not already in one, wrap the Python launcher inside vt.
+if [ -z "$VIBETUNNEL_SESSION_ID" ] && command -v vt &>/dev/null; then
+    echo -e "${GREEN}Starting Claude with Slack integration (via VibeTunnel)...${NC}"
+    echo ""
+    exec vt python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+else
+    if [ -n "$VIBETUNNEL_SESSION_ID" ]; then
+        echo -e "${GREEN}Starting Claude with Slack integration (VibeTunnel already active)...${NC}"
+    else
+        echo -e "${YELLOW}Starting Claude with Slack integration (vt not found, no VibeTunnel)...${NC}"
+    fi
+    echo ""
+    exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
+fi
