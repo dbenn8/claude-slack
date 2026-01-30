@@ -6,6 +6,19 @@
 
 set -e
 
+# Start VibeTunnel and re-launch this script inside it
+if [ -z "$CLAUDE_SLACK_VT_LAUNCHED" ] && command -v vt &>/dev/null; then
+    echo -e "\033[0;34mLaunching VibeTunnel session...\033[0m"
+    export CLAUDE_SLACK_VT_LAUNCHED=1
+    exec vt "$0" "$@"
+fi
+
+if [ -n "$CLAUDE_SLACK_VT_LAUNCHED" ]; then
+    echo -e "\033[0;32m✓ Running inside VibeTunnel\033[0m"
+else
+    echo -e "\033[1;33m⚠ VibeTunnel not found, running without it\033[0m"
+fi
+
 # Get the script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -149,18 +162,6 @@ sleep 2
 # Step 4: Launch Claude with the hybrid wrapper
 cd "$PROJECT_DIR"
 
-# Ensure we're inside a VibeTunnel session for full terminal visibility.
-# If not already in one, wrap the Python launcher inside vt.
-if [ -z "$VIBETUNNEL_SESSION_ID" ] && command -v vt &>/dev/null; then
-    echo -e "${GREEN}Starting Claude with Slack integration (via VibeTunnel)...${NC}"
-    echo ""
-    exec vt python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
-else
-    if [ -n "$VIBETUNNEL_SESSION_ID" ]; then
-        echo -e "${GREEN}Starting Claude with Slack integration (VibeTunnel already active)...${NC}"
-    else
-        echo -e "${YELLOW}Starting Claude with Slack integration (vt not found, no VibeTunnel)...${NC}"
-    fi
-    echo ""
-    exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
-fi
+echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
+echo ""
+exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"
