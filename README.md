@@ -1,286 +1,508 @@
-# Claude-Slack Integration
+# Slack Integration for Claude Code
 
-Slack integration for Claude Code sessions - enables bidirectional communication between Claude terminal sessions and Slack.  I've found vibetunnel + tailscale super helpful for using claude-code on the go, but have found the UI lacking.  Especially as sessions get longer, VT can get bogged down and difficult to use.  Slack has the benefits of notifying the user when claude-code finishes generating a response and also a much better UI for consuming and generating responses while on the go (STT especially!).  
+Bidirectional Slack integration allowing you to:
+- **Claude → Slack**: Automatic notifications when Claude Code events occur
+- **Slack → Claude**: Send responses from mobile and use them in Claude Code
 
-## Overview
+## 📌 Choose Your Phase
 
-This integration allows Claude Code sessions to:
-- Send a claude-code session specific message to a slack channel to seed a new slack thread.
-- Receive,act on, and respond to messages added to the session specific thread
-- Support multiple concurrent Claude sessions across different projects (as separate slack threads)
-- Maintain conversation history and context
+- **Phase 1 (This Guide)**: Manual `/check` command - Simple, stable, works immediately
+- **Phase 2 (Auto-Injection)**: Fully hands-free - See [PHASE2_README.md](PHASE2_README.md)
 
 ## Architecture
 
-This installation can serve all Claude projects on your machine:
-- Single installation at `~/.claude/claude-slack`
-- One Slack bot (socket mode enabled) serves all projects
-- Central session registry tracks active sessions
-- Hook templates are copied to each project that needs Slack integration
-- **WARNING**: This hasn't been tested for scenarios where on_stop and/or on_notification hooks already exist for your slack project.  They MIGHT OVERWRITE YOUR EXISTING HOOK FILES (SO BACK THEM UP IN ADVANCE), or more likely, you might need to manually copy the relevant content from the hook templates into your existing hooks if you have them. 
-
-## Quick Start
-
-### 1. Prerequisites
-
-- Python 3.8+
-- Slack workspace with admin access to create apps
-- Claude Code installed
-
-### 2. Create Slack App
-
-1. Go to https://api.slack.com/apps and click "Create New App"
-2. Choose "From an app manifest"
-3. Select your workspace
-4. Paste this manifest:
-
-```yaml
-display_information:
-  name: Claude Code Bot
-  description: Bidirectional communication with Claude Code sessions
-  background_color: "#000000"
-features:
-  bot_user:
-    display_name: Claude Code Bot
-    always_online: true
-oauth_config:
-  scopes:
-    bot:
-      - channels:history
-      - channels:read
-      - chat:write
-      - reactions:read
-      - reactions:write
-      - users:read
-      - groups:history
-      - groups:read
-      - im:history
-      - im:read
-      - mpim:history
-      - mpim:read
-settings:
-  event_subscriptions:
-    bot_events:
-      - app_mention
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-      - reaction_added
-  interactivity:
-    is_enabled: false
-  org_deploy_enabled: false
-  socket_mode_enabled: true
-  token_rotation_enabled: false
+```
+┌──────────────────┐        Hooks          ┌───────────────┐
+│  Claude Code     │────────────────────────>│     Slack     │
+│                  │    (auto-notify)        │   Workspace   │
+│                  │                         │               │
+│                  │<────────────────────────│               │
+│                  │  /check (manual read)   └───────────────┘
+└──────────────────┘                                │
+                                                    │ WebSocket
+                                                    │ (Socket Mode)
+                                                    ▼
+                                         ┌─────────────────────┐
+                                         │  slack_listener.py  │
+                                         │  (runs separately)  │
+                                         │  Saves to:          │
+                                         │  slack_response.txt │
+                                         └─────────────────────┘
 ```
 
-5. Click "Create"
-6. Go to "OAuth & Permissions" and install the app to your workspace
-7. Copy the "Bot User OAuth Token" (starts with `xoxb-`)
-8. Go to "Basic Information" > "App-Level Tokens"
-9. Click "Generate Token and Scopes"
-10. Name: "Socket Mode Token", add scope: `connections:write`
-11. Copy the token (starts with `xapp-`)
+## Features
 
-### 3. Installation
+### MVP (Phase 1) - Implemented ✅
+- ✅ Claude Code automatically sends messages to Slack on key events
+- ✅ You reply in Slack (mobile-friendly)
+- ✅ Type `/check` in Claude Code to retrieve response
+- ✅ Works with simple text responses: "1", "2", "3", or custom text
+- ✅ Slack bot acknowledges receipt with ✅ reaction
 
+### Phase 2 - Auto-Injection ✅
+- ✅ Automatic response injection (no manual `/check` needed)
+- ✅ Sub-second latency from Slack → Claude
+- ✅ Fully hands-free mobile control
+- 📖 See [PHASE2_README.md](PHASE2_README.md) for setup
+
+### Phase 2.5 - Multi-Session Support ✅
+- ✅ Unlimited concurrent Claude sessions
+- ✅ Thread-based organization in Slack
+- ✅ Session picker UI for mobile
+- ✅ Auto-routing by thread
+- ✅ VibeTunnel compatibility
+- ✅ Backward compatible with Phase 2
+- 📖 See [PHASE25_README.md](PHASE25_README.md) for full guide
+
+**Quick Start Phase 2.5**:
 ```bash
-# Clone this repository
-git clone https://github.com/YOUR_USERNAME/claude-claude-slack.git ~/.claude/claude-slack
+# Start registry + Slack bot (one time)
+cd slack_bot && ./start-all
 
-# Navigate to the directory
-cd ~/.claude/claude-slack
+# Start multiple Claude sessions (separate terminals)
+cd /path/to/project1 && ./claude-slack
+cd /path/to/project2 && ./claude-slack
+cd /path/to/project3 && ./claude-slack
 
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your tokens
-nano .env  # or use your preferred editor
+# Use from mobile: Select thread in Slack, reply
 ```
 
-Add your tokens to `.env`:
-```bash
-SLACK_BOT_TOKEN=xoxb-your-bot-token-here
-SLACK_APP_TOKEN=xapp-your-app-token-here
-SLACK_CHANNEL=#your-channel-name
-```
+### Future: Phase 3 🚧
+- Interactive buttons (1️⃣ 2️⃣ 3️⃣), session pause/resume, team collaboration
 
-### 4. Add to PATH (optional but recommended)
+## Prerequisites
 
-```bash
-echo 'export PATH="$HOME/.claude/claude-slack/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
+1. **Slack Workspace**: You must have admin access to create apps
+2. **Python 3.8+**: For running the Slack bot
+3. **Claude Code**: Installed and working
 
-### 5. Test the Installation
+## Setup Instructions
 
-```bash
-# Start the Slack listener
-claude-slack-listener
+### Step 1: Create Slack App (10 minutes)
 
-# In another terminal, test sending a message
-claude-slack-test
-```
+1. **Go to Slack API**: https://api.slack.com/apps
+2. **Create New App**:
+   - Click "Create New App"
+   - Choose "From scratch"
+   - App Name: "Claude Code Bot" (or any name)
+   - Select your workspace
+   - Click "Create App"
 
-## Usage
+3. **Enable Socket Mode**:
+   - In left sidebar → Settings → Socket Mode
+   - Toggle "Enable Socket Mode" → ON
+   - Click "Generate an app-level token"
+   - Token Name: "Socket Mode Token"
+   - Scope: `connections:write`
+   - Click "Generate"
+   - **COPY THE TOKEN** (starts with `xapp-`) → Save for later
+   - Click "Done"
 
-### Starting a New Claude Session with Slack
+4. **Add Bot Token Scopes**:
+   - In left sidebar → Features → OAuth & Permissions
+   - Scroll to "Scopes" → "Bot Token Scopes"
+   - Click "Add an OAuth Scope" and add these:
+     - `app_mentions:read` - Read @mentions
+     - `channels:history` - Read channel messages
+     - `channels:read` - List channels
+     - `chat:write` - Send messages
+     - `im:history` - Read DMs
+     - `im:read` - Access DM info
+     - `im:write` - Send DMs
+     - `reactions:write` - Add emoji reactions
 
-```bash
-# Navigate to your project
-cd /path/to/your/project
+5. **Install App to Workspace**:
+   - Scroll up on same page → "OAuth Tokens for Your Workspace"
+   - Click "Install to Workspace"
+   - Review permissions → Click "Allow"
+   - **COPY THE BOT TOKEN** (starts with `xoxb-`) → Save for later
 
-# Initialize Slack integration for this project
-claude-slack
+6. **Subscribe to Events**:
+   - In left sidebar → Features → Event Subscriptions
+   - Toggle "Enable Events" → ON
+   - Scroll to "Subscribe to bot events"
+   - Click "Add Bot User Event" and add:
+     - `app_mention` - When someone @mentions your bot
+     - `message.channels` - Messages in channels
+     - `message.im` - Direct messages
+   - Click "Save Changes"
 
-# You should receive a new message in the slack channel you added to your .env file
-# You can reply 'as a thread' to the message to communicate with the claude session that sent the initial message
-# If your reply doesn't automatically get a green checkmark emoji applied to it, you need to @mention your claud bot to wake it back up and try your message again.
-# Claude code should receive your message as terminal input, generate it's response, and send it back to slack automatically.  You can continue the conversation as needed.
+7. **Create Channel** (optional but recommended):
+   - In Slack, create a new channel: `#btcbot-claude`
+   - Invite the bot: Type `/invite @Claude Code Bot` in the channel
+   - This will be your dedicated channel for Claude notifications
 
-```
+### Step 2: Configure Slack Bot (5 minutes)
 
+1. **Navigate to project**:
+   ```bash
+   cd /Users/danielbennett/codeNew/btcbot/slack_bot
+   ```
 
-## Available Commands
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-After adding `~/.claude/claude-slack/bin` to your PATH:
+3. **Create .env file**:
+   ```bash
+   cp .env.example .env
+   ```
 
-- `claude-slack` - Initialize Slack for current project
-- `claude-slack-listener` - Start the Slack listener daemon
-- `claude-slack-test` - Test Slack connection
-- `claude-slack-ensure` - Ensure listener is running
-- `claude-slack-sessions` - List active sessions
-- `claude-slack-cleanup` - Clean up stale sessions
+4. **Edit .env file** with your tokens:
+   ```bash
+   # Open in your editor
+   nano .env
+   # Or
+   code .env
+   ```
+
+   Replace with your actual tokens:
+   ```
+   SLACK_BOT_TOKEN=xoxb-YOUR-ACTUAL-BOT-TOKEN
+   SLACK_APP_TOKEN=xapp-YOUR-ACTUAL-APP-TOKEN
+   SLACK_CHANNEL=#btcbot-claude
+   ```
+
+5. **Test the bot**:
+   ```bash
+   python3 slack_listener.py
+   ```
+
+   You should see:
+   ```
+   🚀 Starting Slack bot...
+   📁 Response file: /Users/danielbennett/codeNew/btcbot/slack_response.txt
+   ✅ Slack bot is running!
+      Listening for:
+      - @mentions in channels
+      - Direct messages
+      - Channel messages starting with / or !
+      - Single digit responses (1, 2, 3)
+
+      Press Ctrl+C to stop
+   ```
+
+6. **Test in Slack**:
+   - Go to `#btcbot-claude` channel
+   - Type: `@Claude Code Bot test`
+   - Bot should:
+     - Add ✅ reaction to your message
+     - Reply: "✅ Got it! Saved response: test"
+   - Check terminal: Should show "📝 Saved mention..."
+   - Check file exists: `ls -la ../slack_response.txt`
+
+7. **Keep bot running**:
+   - Open a new terminal tab/window for the bot
+   - Or use `tmux`/`screen` to run in background
+   - Or use `nohup python3 slack_listener.py &`
+
+### Step 3: Configure Claude Code Hooks (5 minutes)
+
+1. **Navigate to project root**:
+   ```bash
+   cd /Users/danielbennett/codeNew/btcbot
+   ```
+
+2. **Create settings file**:
+   ```bash
+   cp .claude/settings.local.json.example .claude/settings.local.json
+   ```
+
+3. **Edit settings** with your bot token:
+   ```bash
+   nano .claude/settings.local.json
+   # Or
+   code .claude/settings.local.json
+   ```
+
+   Replace `xoxb-your-bot-token-here` with your actual bot token:
+   ```json
+   {
+     "env": {
+       "SLACK_BOT_TOKEN": "xoxb-YOUR-ACTUAL-BOT-TOKEN",
+       "SLACK_CHANNEL": "#btcbot-claude"
+     },
+     "hooks": { ... }
+   }
+   ```
+
+4. **Verify hook is executable**:
+   ```bash
+   ls -la .claude/hooks/slack_bidirectional.py
+   ```
+
+   Should show `-rwxr-xr-x` (x = executable)
+
+   If not:
+   ```bash
+   chmod +x .claude/hooks/slack_bidirectional.py
+   ```
+
+### Step 4: Test End-to-End (5 minutes)
+
+1. **Start Claude Code**:
+   ```bash
+   claude
+   ```
+
+2. **Send a test prompt**:
+   ```
+   You: "Test Slack integration"
+   ```
+
+3. **Check Slack**:
+   - Go to `#btcbot-claude` channel
+   - You should see a message like:
+     ```
+     📝 UserPromptSubmit
+     ```Session: abc12345
+     Project: btcbot
+
+     Prompt: Test Slack integration```
+
+     _Reply with: 1, 2, 3, or custom text_
+     ```
+
+4. **Reply in Slack** (from mobile or desktop):
+   ```
+   yes, proceed
+   ```
+
+5. **Check for response in Claude Code**:
+   ```
+   You: /check
+   ```
+
+   You should see:
+   ```
+   ============================================================
+   📱 SLACK RESPONSE:
+   ============================================================
+
+   yes, proceed
+
+   ============================================================
+
+   You can now type this response in Claude Code (or just press Enter to accept it)
+   ```
+
+6. **Type response in Claude Code**:
+   ```
+   You: yes, proceed
+   ```
+
+7. **Success!** 🎉 You now have bidirectional Slack integration
+
+## Usage Workflow
+
+### Normal Usage (Mobile Control)
+
+1. **Start Claude Code session** (on laptop):
+   ```bash
+   cd /Users/danielbennett/codeNew/btcbot
+   claude
+   ```
+
+2. **Work with Claude** - Claude will auto-notify Slack on:
+   - Every prompt you send (`UserPromptSubmit` event)
+   - When Claude finishes (`Stop` event)
+
+3. **Claude asks a question**:
+   ```
+   Claude: "Should I proceed with this analysis? (y/n)"
+   ```
+
+4. **Check Slack on mobile** - You'll see:
+   ```
+   ✅ Stop
+   Session: abc12345
+   Project: btcbot
+
+   Claude has finished processing.
+
+   Reply with: 1, 2, 3, or custom text
+   ```
+
+5. **Reply in Slack** (mobile):
+   - Type `1` (yes)
+   - Or `2` (always allow)
+   - Or `3` (no)
+   - Or any custom text: "yes, use RSI 30"
+
+6. **Back at laptop**, check for response:
+   ```
+   You: /check
+   ```
+
+7. **See response**:
+   ```
+   ============================================================
+   📱 SLACK RESPONSE:
+   ============================================================
+
+   1
+
+   ============================================================
+   ```
+
+8. **Type response in Claude**:
+   ```
+   You: 1
+   ```
+   (Or just type the custom text)
+
+9. **Claude continues** with your response
+
+### Quick Commands
+
+- `/check` - Check for Slack responses
+- `1` - Common response (yes/proceed)
+- `2` - Common response (always allow)
+- `3` - Common response (no/decline)
 
 ## Troubleshooting
 
-### Quick Emoji Responses
+### Bot not receiving messages
 
-Permission prompts now show 1️⃣ 2️⃣ 3️⃣ emoji reactions - just tap to respond! Requires:
-- `reactions:read` scope (included in manifest above)
-- `reaction_added` event subscription (included in manifest above)
-
-### Socket Starvation Issue (FIXED)
-
-**Previous issue**: Messages sometimes not received, requiring @ mentions to "wake up" the listener.
-
-**Solution applied**:
-- Increased socket backlog from 1 to 128 connections
-- Added retry logic with exponential backoff
-- Added proper socket timeout handling
-
-If you still experience issues, ensure your Slack app has all the scopes and events from the manifest above.
-
-### Checking Logs
-
+**Check bot is running**:
 ```bash
-# Check listener logs
-tail -f /tmp/slack_listener.log
-
-# Check hook execution logs
-tail -f /tmp/stop_hook_debug.log
-
-# Check session registry
-sqlite3 /tmp/claude_sessions/registry.db "SELECT * FROM sessions;"
+# In slack_bot directory
+ps aux | grep slack_listener
 ```
 
-### Common Issues
-
-1. **No response from Claude**:
-   - Check if listener is running: `ps aux | grep slack_listener`
-   - Try @ mentioning the bot to wake it up
-   - Check logs for errors
-
-2. **Duplicate messages**:
-   - Multiple listeners may be running
-   - Run `claude-slack-cleanup` to clean up
-
-3. **Session not found**:
-   - Session may have expired (24 hour timeout)
-   - Check registry: `claude-slack-sessions`
-
-4. **Permission denied**:
-   - Ensure scripts are executable: `chmod +x ~/.claude/claude-slack/bin/*`
-
-## Project Structure
-
-```
-~/.claude/claude-slack/
-├── core/                 # Core Python modules
-│   ├── slack_listener.py      # Main Slack event listener
-│   ├── session_registry.py    # Session management
-│   ├── claude_wrapper_multi.py # Multi-session Claude wrapper
-│   ├── transcript_parser.py   # Parse Claude transcripts
-│   └── config.py              # Configuration management
-├── hooks/                # Claude Code hook templates
-│   ├── on_pretooluse.py      # Permission requests with full context (NEW!)
-│   ├── on_stop.py            # Response completion hook
-│   ├── on_notification.py    # User notification hook
-│   └── settings.local.json.template
-├── bin/                  # Executable scripts
-│   ├── claude-slack          # Project initialization
-│   ├── claude-slack-listener # Start listener daemon
-│   └── ...
-├── .env.example          # Environment template
-└── README.md            # This file
+If not running:
+```bash
+cd slack_bot
+python3 slack_listener.py
 ```
 
-## Security
+**Check bot is in channel**:
+- Type `/invite @Claude Code Bot` in the Slack channel
+- Bot must be explicitly invited to channels
 
-- **NEVER** commit `.env` file to git
-- Slack tokens are sensitive - rotate immediately if exposed
-- Use `.gitignore` to exclude sensitive files
-- See SECURITY.md for detailed security practices
+**Check permissions**:
+- Slack App → OAuth & Permissions → verify all scopes listed above
 
-## Contributing
+### Claude not sending to Slack
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Test thoroughly
-4. Submit a pull request
+**Check token in settings**:
+```bash
+cat .claude/settings.local.json
+# Verify SLACK_BOT_TOKEN is set correctly
+```
 
-## Hooks Explained
+**Check hook is executable**:
+```bash
+ls -la .claude/hooks/slack_bidirectional.py
+chmod +x .claude/hooks/slack_bidirectional.py  # If needed
+```
 
-This integration uses three Claude Code hooks:
+**Check slack_sdk is installed**:
+```bash
+pip install slack-sdk
+```
 
-### 1. **PreToolUse Hook** (on_pretooluse.py) - NEW! ✨
-- **Fires:** Before Claude executes any tool (Bash, Write, Edit, Read, etc.)
-- **Purpose:** Sends detailed permission requests to Slack with FULL context
-- **What you see:**
-  - Actual bash commands before execution
-  - File paths being written/edited/read
-  - Search patterns and parameters
-  - Everything Claude wants to do, before it happens
-- **Why it's important:** Allows you to make informed security decisions remotely
+**Test hook manually**:
+```bash
+echo '{"session_id": "test123", "project_dir": "/test"}' | \
+  HOOK_EVENT_TYPE=UserPromptSubmit \
+  SLACK_BOT_TOKEN=xoxb-YOUR-TOKEN \
+  SLACK_CHANNEL=#btcbot-claude \
+  python3 .claude/hooks/slack_bidirectional.py
+```
 
-### 2. **Notification Hook** (on_notification.py)
-- **Fires:** When Claude sends generic notifications (idle prompts, auth messages)
-- **Purpose:** Keeps you informed about Claude's status
-- **Note:** This hook has limited context by design (generic alerts only)
+### /check shows no response
 
-### 3. **Stop Hook** (on_stop.py)
-- **Fires:** When Claude finishes generating a response
-- **Purpose:** Sends complete responses to Slack thread
-- **What you see:** Full AI responses with code, explanations, and context
+**Check file exists**:
+```bash
+ls -la slack_response.txt
+cat slack_response.txt
+```
 
-## Known Limitations
+**Check bot wrote to file**:
+- Send test message in Slack
+- Check if file was created/updated
+- Check bot terminal for error messages
 
-- ~~Socket starvation issue requires @ mention workaround~~ **FIXED!**
-- ~~Notifications from Claude aren't printing full content~~ **FIXED!**
-  - PreToolUse hook now provides complete context for all permission requests
-  - See actual bash commands, file contents, and tool parameters before approving
+**File permissions**:
+```bash
+# Ensure file is writable
+chmod 644 slack_response.txt  # If it exists
+```
 
-## License
+### Slack bot crashes
 
-MIT License - see LICENSE file for details
+**Check logs**:
+- Look at terminal output where bot is running
+- Common issues:
+  - Token expired/invalid
+  - Network connection lost
+  - Rate limiting
+
+**Restart bot**:
+```bash
+cd slack_bot
+python3 slack_listener.py
+```
+
+**Check Slack App status**:
+- https://api.slack.com/apps
+- Your App → Settings → Basic Information
+- Verify "Install to Workspace" is active
+
+## Files Overview
+
+```
+btcbot/
+├── slack_bot/
+│   ├── slack_listener.py        # Main Slack bot (runs continuously)
+│   ├── requirements.txt         # Python dependencies
+│   ├── .env.example            # Template for configuration
+│   ├── .env                    # Your tokens (gitignored)
+│   └── README.md               # This file
+│
+├── .claude/
+│   ├── hooks/
+│   │   └── slack_bidirectional.py  # Claude Code hook
+│   ├── commands/
+│   │   └── check.md            # /check slash command
+│   ├── settings.local.json.example  # Template
+│   └── settings.local.json     # Your config (gitignored)
+│
+└── slack_response.txt          # Shared file for responses (gitignored)
+```
+
+## Security Notes
+
+- **Never commit tokens**: `.env` and `settings.local.json` are gitignored
+- **Rotate tokens periodically**: Recommended every 90 days
+- **Use separate bot token**: Don't use your personal user token
+- **Limit channel access**: Only invite bot to channels that need it
+- **Monitor usage**: Check Slack App dashboard for suspicious activity
+
+## Next Steps (Future Phases)
+
+### Phase 2: Auto-Injection Wrapper
+- Build `claude_wrapper.py` to proxy stdin/stdout
+- Automatically inject Slack responses (no manual `/check`)
+- Estimated time: 3-4 hours
+
+### Phase 3: Rich Slack UI
+- Interactive buttons (1️⃣ Yes  2️⃣ Always  3️⃣ No)
+- Threaded messages for context
+- Button 4️⃣ for additional context
+- Rich formatting, code blocks
+- Estimated time: 2-3 hours
 
 ## Support
 
-- Report issues: [GitHub Issues](https://github.com/YOUR_USERNAME/claude-claude-slack/issues)
-- Slack API docs: https://api.slack.com
-- Claude Code docs: https://claude.ai
+For issues:
+1. Check troubleshooting section above
+2. Verify all setup steps completed
+3. Check bot terminal logs
+4. Check Claude Code output for hook errors
 
-## Credits
+## License
 
-Created for use with Anthropic's Claude Code CLI.
+Same as parent project (btcbot)

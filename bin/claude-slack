@@ -6,6 +6,19 @@
 
 set -e
 
+# Start VibeTunnel and re-launch this script inside it
+if [ -z "$CLAUDE_SLACK_VT_LAUNCHED" ] && command -v vt &>/dev/null; then
+    echo -e "\033[0;34mLaunching VibeTunnel session...\033[0m"
+    export CLAUDE_SLACK_VT_LAUNCHED=1
+    exec vt "$0" "$@"
+fi
+
+if [ -n "$CLAUDE_SLACK_VT_LAUNCHED" ]; then
+    echo -e "\033[0;32m✓ Running inside VibeTunnel\033[0m"
+else
+    echo -e "\033[1;33m⚠ VibeTunnel not found, running without it\033[0m"
+fi
+
 # Get the script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -21,7 +34,11 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
+
+# Identify which variant is running
+echo -e "${MAGENTA}[claude-slack] Loading from: ${INTEGRATION_DIR}${NC}"
 
 # Step 1: Ensure listener is ready
 echo -e "${BLUE}Checking Slack integration...${NC}"
@@ -143,9 +160,8 @@ echo -e "${BLUE}Waiting for services to stabilize...${NC}"
 sleep 2
 
 # Step 4: Launch Claude with the hybrid wrapper
+cd "$PROJECT_DIR"
+
 echo -e "${GREEN}Starting Claude with Slack integration...${NC}"
 echo ""
-
-# Pass all arguments through to the Python wrapper
-cd "$PROJECT_DIR"
 exec python3 "$CORE_DIR/claude_wrapper_hybrid.py" "$@"

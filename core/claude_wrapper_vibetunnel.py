@@ -2,47 +2,80 @@
 VibeTunnel-specific wrapper that avoids nested PTY.
 
 Instead of creating a PTY (which VibeTunnel already has), this:
-1. Runs Claude directly (it inherits VibeTunnel's stdin/stdout/stderr)
-2. Socket listener writes Slack input to VibeTunnel's terminal
-3. Claude reads from the same terminal and sees the injected input
+1. Runs Claude with output capture via PTY for permission detection
+2. Forwards all output to stdout while detecting permissions
+3. Socket listener writes Slack input to VibeTunnel's terminal
+4. Claude reads from the same terminal and sees the injected input
 
 Architecture:
     VibeTunnel PTY (only PTY) ← Claude reads from here
         ↑
         └→ Slack input written here
+
+    Output flow:
+        Claude → PTY → Wrapper (detects permissions) → stdout (VibeTunnel displays)
 """
 
 import subprocess
 import sys
 import os
+import pty
+import select
 import signal
+import threading
+
+
+def should_preserve_scrollback():
+    """
+    Check if we should preserve terminal scrollback by disabling alternate screen.
+
+    Reads PRESERVE_SCROLLBACK from environment:
+      - 'auto' (default): Preserve when in VibeTunnel (this module is only called in VibeTunnel)
+      - 'on': Always preserve
+      - 'off': Never preserve
+
+    Returns:
+        bool: True if we should set TERM_PROGRAM_INHIBIT_ALTSCREEN=1
+    """
+    setting = os.environ.get('PRESERVE_SCROLLBACK', 'auto').lower().strip()
+
+    if setting == 'off':
+        return False
+    elif setting == 'on':
+        return True
+    else:  # 'auto' or any other value defaults to auto
+        # In VibeTunnel mode (this module), auto means ON
+        return True
 
 def run_vibetunnel_mode(wrapper):
     """
-    Run Claude in VibeTunnel without creating nested PTY.
+    Run Claude in VibeTunnel with output capture for permission detection.
 
-    Simple approach: Just exec Claude directly.
-    Let VibeTunnel handle all terminal I/O.
-    Socket listener will write to terminal which Claude reads.
+    Uses PTY to capture Claude's output for permission detection while
+    forwarding everything to stdout for VibeTunnel to display.
+    Uses TIOCSTI to inject Slack input into the terminal.
 
     Args:
         wrapper: HybridPTYWrapper instance (for socket, registry, etc)
     """
-    wrapper.logger.info("=== VibeTunnel Mode: Direct execution (no nested PTY) ===")
+    import queue
+    import time
+    import fcntl
+    import termios
+    import struct
 
-    # Setup (but don't create PTY)
+    wrapper.logger.info("=== VibeTunnel Mode: PTY capture with permission detection ===")
+
+    # Setup
     wrapper.setup_socket_directory()
     wrapper.setup_unix_socket()
     wrapper.setup_environment()
     wrapper.register_with_registry()
 
     # Create queue for Slack input
-    import queue
     wrapper.slack_input_queue = queue.Queue()
 
     # Start socket listener for Slack input
-    # It will write to the queue, and we'll write queue items to terminal
-    import threading
     wrapper.socket_thread = threading.Thread(target=wrapper.socket_listener, daemon=True)
     wrapper.socket_thread.start()
 
@@ -58,7 +91,7 @@ def run_vibetunnel_mode(wrapper):
     # Build command
     claude_cmd = [claude_bin, '--session-id', claude_session_uuid] + wrapper.claude_args
 
-    wrapper.logger.info(f"Executing Claude directly: {' '.join(claude_cmd)}")
+    wrapper.logger.info(f"Executing Claude with PTY capture: {' '.join(claude_cmd)}")
 
     # Print custom VibeTunnel banner
     CYAN = "\033[36m"
@@ -73,27 +106,65 @@ def run_vibetunnel_mode(wrapper):
     print(f"{CYAN}Session ID: {BOLD}{wrapper.session_id}{RESET}", file=sys.stderr)
     print(f"{CYAN}Project: {wrapper.project_dir}{RESET}", file=sys.stderr)
     print(f"{CYAN}Input Socket: {wrapper.socket_path}{RESET}", file=sys.stderr)
-    print(f"{YELLOW}VibeTunnel: No-PTY Mode (direct execution){RESET}", file=sys.stderr)
-    print(f"{GREEN}Hooks will handle output streaming to Slack{RESET}", file=sys.stderr)
+    print(f"{YELLOW}VibeTunnel: PTY Mode with permission detection{RESET}", file=sys.stderr)
+    print(f"{GREEN}Permission prompts will be captured and sent to Slack{RESET}", file=sys.stderr)
     print(f"{BOLD}{CYAN}{separator}{RESET}\n", file=sys.stderr)
 
-    # Fork and exec Claude
-    # Child: exec Claude (inherits VibeTunnel's stdin/stdout/stderr)
-    # Parent: Monitor Slack queue and inject input to terminal
-    pid = os.fork()
+    # Fork with PTY for output capture
+    pid, master_fd = pty.fork()
 
     if pid == 0:
         # Child: Change to project dir and exec Claude
         os.chdir(wrapper.project_dir)
+
+        # Preserve scrollback by disabling Claude's alternate screen mode
+        if should_preserve_scrollback():
+            os.environ['TERM_PROGRAM_INHIBIT_ALTSCREEN'] = '1'
+            print(f"{YELLOW}[VibeTunnel] Scrollback preservation enabled{RESET}", file=sys.stderr)
+
         os.execvp(claude_bin, claude_cmd)
         # Never reaches here
     else:
-        # Parent: Monitor Slack input queue
-        wrapper.logger.info(f"Claude forked - PID: {pid}")
+        # Parent: Capture output for permission detection, forward to stdout
+        wrapper.logger.info(f"Claude forked with PTY - PID: {pid}, master_fd: {master_fd}")
+
+        # Save terminal state and set to raw mode (matching standard hybrid wrapper)
+        # Both stdin and master_fd need raw mode for clean pass-through of ANSI sequences
+        import tty
+        old_tty = None
+        try:
+            old_tty = termios.tcgetattr(sys.stdin)
+            tty.setraw(sys.stdin.fileno())
+            wrapper.logger.info("Terminal stdin set to raw mode")
+        except Exception as e:
+            wrapper.logger.warning(f"Could not set stdin to raw mode: {e}")
+
+        try:
+            tty.setraw(master_fd)
+            wrapper.logger.info("PTY master set to raw mode")
+        except Exception as e:
+            wrapper.logger.warning(f"Could not set PTY master to raw mode: {e}")
+
+        # Handle window resize signals
+        def handle_sigwinch(signum, frame):
+            try:
+                size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', size[0], size[1], 0, 0))
+            except Exception:
+                pass
+        signal.signal(signal.SIGWINCH, handle_sigwinch)
+
+        # Try to sync PTY window size with terminal
+        try:
+            size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+            rows, cols = size[0], size[1]
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+            wrapper.logger.debug(f"PTY window size set: {cols}x{rows}")
+        except Exception as e:
+            wrapper.logger.debug(f"Could not set PTY size: {e}")
 
         # Wait for thread_ts (needed for Slack communication)
         wrapper.logger.info("Waiting for Slack thread creation...")
-        import time
         max_wait = 10
         start_time = time.time()
 
@@ -123,44 +194,92 @@ def run_vibetunnel_mode(wrapper):
         if wrapper.thread_ts and hasattr(wrapper, 'claude_session_uuid'):
             wrapper.register_claude_session(wrapper.claude_session_uuid)
 
-        # Monitor for Slack input and write to terminal
-        wrapper.logger.info("Monitoring Slack input queue...")
+        # Main I/O loop: bidirectional - forward stdin→Claude PTY, Claude PTY→stdout
+        wrapper.logger.info("Starting I/O loop with permission detection...")
         try:
             while True:
-                # Check if Claude is still running
+                # Wait for input from user terminal OR output from Claude's PTY
                 try:
-                    os.kill(pid, 0)  # Check if process exists
-                except OSError:
-                    wrapper.logger.info("Claude process ended")
+                    r, w, e = select.select([sys.stdin, master_fd], [], [], 0.1)
+                except (ValueError, OSError):
+                    # master_fd closed
+                    wrapper.logger.info("PTY closed")
                     break
 
-                # Check Slack queue
+                # Forward keyboard input to Claude's PTY
+                if sys.stdin in r:
+                    try:
+                        data = os.read(sys.stdin.fileno(), 1024)
+                        if data:
+                            os.write(master_fd, data)
+                        else:
+                            break
+                    except OSError:
+                        break
+
+                # Forward Claude's output to stdout (VibeTunnel displays it)
+                if master_fd in r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                        if data:
+                            # Add to output buffer for hook fallback
+                            wrapper.add_to_output_buffer(data)
+
+                            # Detect and queue permission prompts
+                            wrapper.permission_detector.process_chunk(data)
+
+                            # Forward to stdout (VibeTunnel displays it)
+                            os.write(sys.stdout.fileno(), data)
+                        else:
+                            # EOF - Claude exited
+                            wrapper.logger.info("Claude process ended (EOF)")
+                            break
+                    except OSError as e:
+                        wrapper.logger.info(f"Read error: {e}")
+                        break
+
+                # Check Slack input queue
                 try:
-                    slack_data = wrapper.slack_input_queue.get(timeout=0.5)
-                    # Inject using two-step pattern: text, sleep, Enter
-                    # Matches standard mode pattern for consistency
-                    import fcntl
-                    import termios as term
-                    import time
+                    slack_data = wrapper.slack_input_queue.get_nowait()
+                    # Write directly to Claude's PTY master fd
+                    # (TIOCSTI won't work here — it pushes to VibeTunnel's PTY,
+                    #  but Claude is on a separate PTY created by pty.fork())
+                    sanitized = slack_data.decode('utf-8', errors='replace').replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+                    os.write(master_fd, sanitized.encode('utf-8'))
+                    wrapper.logger.debug(f"Wrote {len(slack_data)} bytes to Claude PTY")
 
-                    # Step 1: Inject text bytes
-                    for byte in slack_data:
-                        fcntl.ioctl(sys.stdin, term.TIOCSTI, bytes([byte]))
-                    wrapper.logger.debug(f"Injected {len(slack_data)} bytes to terminal")
-
-                    # Step 2: Sleep (give terminal time to process)
                     time.sleep(0.1)
 
-                    # Step 3: Inject Enter key (CR)
-                    fcntl.ioctl(sys.stdin, term.TIOCSTI, b'\r')
-                    wrapper.logger.info(f"Input injected with Enter key ({len(slack_data)} bytes + CR)")
+                    # Send Enter key to submit
+                    os.write(master_fd, b'\r')
+                    wrapper.logger.info(f"Input injected via PTY ({len(slack_data)} bytes + Enter)")
                 except queue.Empty:
                     pass
 
         except KeyboardInterrupt:
             wrapper.logger.info("Interrupted - terminating Claude")
-            os.kill(pid, signal.SIGTERM)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
-        # Wait for Claude to exit
-        os.waitpid(pid, 0)
+        # Restore terminal settings
+        if old_tty is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                wrapper.logger.info("Terminal settings restored")
+            except Exception as e:
+                wrapper.logger.warning(f"Could not restore terminal: {e}")
+
+        # Cleanup
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
         wrapper.logger.info("VibeTunnel mode session ended")

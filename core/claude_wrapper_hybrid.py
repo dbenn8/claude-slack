@@ -59,8 +59,10 @@ load_dotenv(env_path)
 
 try:
     from core.config import get_socket_dir, get_log_dir, get_claude_bin
+    from core.permission_detector import PermissionDetector
 except ModuleNotFoundError:
     from config import get_socket_dir, get_log_dir, get_claude_bin
+    from permission_detector import PermissionDetector
 
 # Configuration
 SOCKET_DIR = os.environ.get("SLACK_SOCKET_DIR", get_socket_dir())
@@ -116,6 +118,26 @@ def debug_log(message):
     """Print debug message if DEBUG mode enabled"""
     if DEBUG:
         print(f"{CYAN}[DEBUG] {message}{RESET}", file=sys.stderr)
+
+
+def should_preserve_scrollback_standard_mode():
+    """
+    Check if we should preserve terminal scrollback in standard (non-VibeTunnel) mode.
+
+    Reads PRESERVE_SCROLLBACK from environment:
+      - 'auto' (default): Don't preserve in standard mode (only VibeTunnel)
+      - 'on': Always preserve
+      - 'off': Never preserve
+
+    Returns:
+        bool: True if we should set TERM_PROGRAM_INHIBIT_ALTSCREEN=1
+    """
+    setting = os.environ.get('PRESERVE_SCROLLBACK', 'auto').lower().strip()
+
+    if setting == 'on':
+        return True
+    else:  # 'auto' or 'off' - don't preserve in standard mode
+        return False
 
 
 def generate_session_id():
@@ -447,6 +469,11 @@ class HybridPTYWrapper:
         self.buffer_lock = threading.Lock()
         self.logger.info(f"Output buffer initialized: {self.buffer_file}")
 
+        # Permission detector for queue-based permission capture
+        # Detects permissions in real-time as PTY output arrives
+        self.permission_detector = PermissionDetector(session_id, logger=self.logger)
+        self.logger.info(f"Permission detector initialized")
+
     def setup_socket_directory(self):
         """Create socket directory if it doesn't exist"""
         os.makedirs(SOCKET_DIR, exist_ok=True)
@@ -723,7 +750,13 @@ class HybridPTYWrapper:
                             self.logger.info("Input queued for VibeTunnel mode")
                         else:
                             # Standard mode - write to PTY
-                            bytes_written = os.write(self.master_fd, data.encode('utf-8'))
+                            # Sanitize newlines: Claude Code enters multi-line input mode
+                            # when it receives embedded newlines, causing the final \r to NOT
+                            # submit. Replace newlines with spaces so pasted content submits.
+                            sanitized = data.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+                            if sanitized != data:
+                                self.logger.info(f"Sanitized newlines in input ({len(data)} -> {len(sanitized)} chars)")
+                            bytes_written = os.write(self.master_fd, sanitized.encode('utf-8'))
                             self.logger.debug(f"Wrote {bytes_written} bytes to PTY master")
                             time.sleep(0.1)
                             os.write(self.master_fd, b'\r')
@@ -923,6 +956,14 @@ class HybridPTYWrapper:
             except Exception as e:
                 self.logger.error(f"Error removing buffer file: {e}")
 
+        # Clean up permission detector queue file
+        if self.permission_detector:
+            try:
+                self.permission_detector.cleanup()
+                self.logger.debug("Permission detector cleaned up")
+            except Exception as e:
+                self.logger.error(f"Error cleaning up permission detector: {e}")
+
         self.logger.info("Cleanup completed")
 
     def run(self):
@@ -1002,6 +1043,11 @@ class HybridPTYWrapper:
             if pid == 0:  # Child process
                 # Ensure we're in the project directory so Claude finds .claude/settings.local.json
                 os.chdir(self.project_dir)
+
+                # Preserve scrollback by disabling Claude's alternate screen mode (if user requested)
+                if should_preserve_scrollback_standard_mode():
+                    os.environ['TERM_PROGRAM_INHIBIT_ALTSCREEN'] = '1'
+                    print(f"{YELLOW}[Wrapper] Scrollback preservation enabled (PRESERVE_SCROLLBACK=on){RESET}", file=sys.stderr)
 
                 # Execute Claude Code
                 os.execvp(claude_bin, claude_cmd)
@@ -1096,6 +1142,8 @@ class HybridPTYWrapper:
                                 if data:
                                     # Add to output buffer for permission prompt capture
                                     self.add_to_output_buffer(data)
+                                    # Detect and queue permission prompts in real-time
+                                    self.permission_detector.process_chunk(data)
                                     # Write to terminal (hooks will capture this)
                                     os.write(sys.stdout.fileno(), data)
                                 else:
@@ -1118,6 +1166,8 @@ class HybridPTYWrapper:
                                 if data:
                                     # Add to output buffer for permission prompt capture
                                     self.add_to_output_buffer(data)
+                                    # Detect and queue permission prompts in real-time
+                                    self.permission_detector.process_chunk(data)
                                     os.write(sys.stdout.fileno(), data)
                                 else:
                                     # Claude exited

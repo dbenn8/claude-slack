@@ -265,6 +265,176 @@ def handle_mention(event, say):
     print(f"📝 Sent mention from user {user}{thread_info}: {clean_text[:100]}")
 
 
+def handle_pop_command(channel, thread_ts, say, count=1):
+    """
+    Handle !pop command - extract the latest assistant response(s) from the
+    transcript and post to Slack. Used as a workaround when the on_stop
+    hook fails to post (e.g., transcript flush lag).
+
+    Args:
+        count: Number of recent responses to post (default 1)
+    """
+    import glob
+    import json as json_mod
+    import re as re_mod
+
+    if not thread_ts:
+        say("⚠️ `!pop` must be used in a session thread.")
+        return
+
+    if not registry_db:
+        say(text="⚠️ Registry database not available.", thread_ts=thread_ts)
+        return
+
+    try:
+        # Find the Claude UUID session for this thread (longer session_id)
+        from registry_db import SessionRecord
+        with registry_db.session_scope() as db_session:
+            records = db_session.query(SessionRecord).filter_by(
+                slack_thread_ts=thread_ts,
+                status='active'
+            ).all()
+
+            if not records:
+                say(text="⚠️ No active session found for this thread.", thread_ts=thread_ts)
+                return
+
+            # Find the Claude UUID session (36 chars with dashes)
+            claude_session = None
+            for record in records:
+                if len(record.session_id) > 8:
+                    claude_session = record
+                    break
+
+            if not claude_session:
+                say(text="⚠️ No Claude session ID found. Only wrapper session exists.", thread_ts=thread_ts)
+                return
+
+            session_id = claude_session.session_id
+
+        # Find the transcript file
+        claude_projects_dir = os.path.expanduser("~/.claude/projects")
+        transcript_path = None
+        for project_dir in glob.glob(os.path.join(claude_projects_dir, "*")):
+            candidate = os.path.join(project_dir, f"{session_id}.jsonl")
+            if os.path.exists(candidate):
+                transcript_path = candidate
+                break
+
+        if not transcript_path:
+            say(text=f"⚠️ Transcript not found for session `{session_id[:8]}...`", thread_ts=thread_ts)
+            return
+
+        # Parse transcript — collect all assistant text responses with timestamps
+        # Group consecutive text entries that belong to the same logical response
+        # A "response" = all text blocks between user messages
+        timestamp_pattern = re_mod.compile(r'^\s*\d{4}/\d{2}/\d{2}:\d{2}:\d{2}:\d{2}\s*$')
+        responses = []  # list of {"timestamp": str, "text": str}
+        current_response_texts = []
+        current_timestamp = None
+
+        with open(transcript_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json_mod.loads(line)
+                    entry_type = entry.get('type')
+
+                    # When we hit a user message, finalize the current response
+                    if entry_type == 'user' and current_response_texts:
+                        combined = '\n\n'.join(current_response_texts)
+                        responses.append({
+                            "timestamp": current_timestamp,
+                            "text": combined
+                        })
+                        current_response_texts = []
+                        current_timestamp = None
+
+                    if entry_type == 'assistant':
+                        content = entry.get('message', {}).get('content', [])
+                        ts = entry.get('timestamp', '')
+                        text_blocks = [
+                            c.get('text', '')
+                            for c in content
+                            if isinstance(c, dict) and c.get('type') == 'text' and c.get('text', '').strip()
+                        ]
+                        for tb in text_blocks:
+                            stripped = tb.strip()
+                            # If it's a bare timestamp, use it as the response timestamp
+                            if timestamp_pattern.match(stripped):
+                                current_timestamp = stripped
+                            else:
+                                if current_timestamp is None and ts:
+                                    # Use the JSONL entry timestamp as fallback
+                                    current_timestamp = ts
+                                current_response_texts.append(tb.strip())
+                except (json_mod.JSONDecodeError, KeyError):
+                    continue
+
+        # Finalize any remaining response
+        if current_response_texts:
+            combined = '\n\n'.join(current_response_texts)
+            responses.append({
+                "timestamp": current_timestamp,
+                "text": combined
+            })
+
+        if not responses:
+            say(text="⚠️ No assistant text responses found in transcript.", thread_ts=thread_ts)
+            return
+
+        # Get the last N responses
+        to_post = responses[-count:]
+
+        bot_token = os.environ.get("SLACK_BOT_TOKEN")
+        if not bot_token:
+            say(text="⚠️ SLACK_BOT_TOKEN not set.", thread_ts=thread_ts)
+            return
+
+        try:
+            from slack_formatter import format_for_slack
+        except ImportError:
+            format_for_slack = None
+
+        from slack_sdk import WebClient
+        client = WebClient(token=bot_token)
+
+        for resp in to_post:
+            ts_label = resp["timestamp"] or "unknown time"
+            text_body = resp["text"]
+
+            if format_for_slack:
+                text_body = format_for_slack(text_body)
+
+            message = f"*{ts_label}*\n{text_body}"
+
+            # Split into chunks if needed (Slack max 3000 chars per message)
+            max_len = 3000
+            chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
+
+            for i, chunk in enumerate(chunks):
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=chunk,
+                        unfurl_links=False,
+                        unfurl_media=False,
+                    )
+                except Exception as e:
+                    print(f"❌ Pop: Failed to post chunk {i+1}: {e}", file=sys.stderr)
+
+        print(f"✅ Pop: Posted {len(to_post)} response(s) for session {session_id[:8]}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"❌ Pop command error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        say(text=f"⚠️ Error running pop: {e}", thread_ts=thread_ts)
+
+
 @app.event("message")
 def handle_message(event, say):
     """
@@ -303,6 +473,20 @@ def handle_message(event, say):
         # Allow: /command, !command, or plain numbers (1, 2, 3)
         if not (text.startswith('/') or text.startswith('!') or text.isdigit()):
             return
+
+    # Handle !pop / !pop N command - post latest Claude response(s) to Slack
+    text_lower = text.lower().strip()
+    if text_lower.startswith('!pop') or text_lower.startswith('/pop'):
+        # Parse optional count: "!pop 3" → 3 messages
+        parts = text_lower.split()
+        count = 1
+        if len(parts) > 1:
+            try:
+                count = max(1, int(parts[1]))
+            except ValueError:
+                count = 1
+        handle_pop_command(channel, thread_ts, say, count=count)
+        return
 
     # Send response to Claude Code (registry socket, legacy socket, or file)
     mode = send_response(text, thread_ts=thread_ts)

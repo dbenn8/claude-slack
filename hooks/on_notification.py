@@ -60,7 +60,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Hook version (for auto-updates)
-HOOK_VERSION = "2.1.0"
+HOOK_VERSION = "2.2.0"
 
 # Debug log file path
 DEBUG_LOG = "/tmp/notification_hook_debug.log"
@@ -178,7 +178,7 @@ load_env_file()
 
 # Log all relevant environment variables (redact sensitive ones)
 debug_log("Environment variables:", "ENV")
-for key in ["SLACK_BOT_TOKEN", "REGISTRY_DATA_DIR", "CLAUDE_TRANSCRIPT_PATH"]:
+for key in ["SLACK_BOT_TOKEN", "REGISTRY_DB_PATH", "CLAUDE_TRANSCRIPT_PATH"]:
     value = os.environ.get(key)
     if value:
         if "TOKEN" in key:

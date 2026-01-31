@@ -58,7 +58,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Hook version for auto-update detection
-HOOK_VERSION = "1.1.0"
+HOOK_VERSION = "1.2.0"
 
 # Debug log file path
 DEBUG_LOG = "/tmp/pretooluse_hook_debug.log"

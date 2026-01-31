@@ -26,7 +26,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -169,7 +169,7 @@ load_env_file()
 
 # Log all relevant environment variables (redact sensitive ones)
 debug_log("Environment variables:", "ENV")
-for key in ["SLACK_BOT_TOKEN", "REGISTRY_DATA_DIR", "CLAUDE_TRANSCRIPT_PATH"]:
+for key in ["SLACK_BOT_TOKEN", "REGISTRY_DB_PATH", "CLAUDE_TRANSCRIPT_PATH"]:
     value = os.environ.get(key)
     if value:
         if "TOKEN" in key:
@@ -731,13 +731,43 @@ def enhance_notification_message(
 
         # For permission prompts, extract tool details and add numbered options
         if notification_type == "permission_prompt" and os.path.exists(transcript_path):
-            debug_log("Permission prompt detected, trying output buffer first", "ENHANCE")
+            debug_log("Permission prompt detected, checking queue first", "ENHANCE")
 
-            # FIRST: Try to get exact permission text from output buffer
+            # PRIORITY 1: Try to get exact permission from queue (fastest - already parsed)
+            exact_options_from_queue = None
+            queue_tool_name = None
+            queue_raw_text = None
+            try:
+                from permission_detector import get_permission_from_queue
+                queue_permission = get_permission_from_queue(session_id)
+                if queue_permission:
+                    exact_options_from_queue = queue_permission.get("options", [])
+                    queue_tool_name = queue_permission.get("tool_name")
+                    queue_raw_text = queue_permission.get("raw_text", "")
+                    debug_log(f"SUCCESS: Got permission from queue: {exact_options_from_queue}", "ENHANCE")
+
+                    # Auto-populate catalog with this permission
+                    try:
+                        from permission_catalog import add_to_catalog
+                        if queue_tool_name and exact_options_from_queue:
+                            catalog_key = add_to_catalog(queue_tool_name, exact_options_from_queue, queue_raw_text)
+                            debug_log(f"Added to catalog: key={catalog_key}", "ENHANCE")
+                    except ImportError:
+                        debug_log("Permission catalog not available", "ENHANCE")
+                    except Exception as ce:
+                        debug_log(f"Error adding to catalog: {ce}", "ENHANCE")
+
+            except ImportError:
+                debug_log("Permission detector not available, falling back to buffer", "ENHANCE")
+            except Exception as e:
+                debug_log(f"Error reading queue: {e}", "ENHANCE")
+
+            # PRIORITY 2: Try to get exact permission text from output buffer
             exact_options_from_buffer = None
             buffer_file = f"/tmp/claude_output_{session_id}.txt"
 
-            if os.path.exists(buffer_file):
+            # Only try buffer if queue didn't succeed
+            if not exact_options_from_queue and os.path.exists(buffer_file):
                 try:
                     # RETRY LOOP: Buffer might not be ready yet, check multiple times
                     # 10 attempts × 0.2s = 2 seconds max wait (unnoticeable to user)
@@ -821,11 +851,27 @@ def enhance_notification_message(
                         enhanced += f"\n_Context: {snippet}..._\n"
 
                 # Add numbered response options with EXACT Claude wording
-                # Priority: Buffer options > Hardcoded mapping > Fallback
-                options_to_use = exact_options_from_buffer or exact_options
+                # Priority: Queue options > Buffer options > Catalog > Hardcoded mapping > Fallback
+                exact_options_from_catalog = None
+                if not exact_options_from_queue and not exact_options_from_buffer:
+                    # Try catalog lookup before falling back to hardcoded mapping
+                    try:
+                        from permission_catalog import lookup_catalog
+                        catalog_entry = lookup_catalog(tool_name, tool_input)
+                        if catalog_entry:
+                            exact_options_from_catalog = catalog_entry.get("options", [])
+                            debug_log(f"Found options in catalog: {exact_options_from_catalog}", "ENHANCE")
+                    except ImportError:
+                        debug_log("Permission catalog not available for lookup", "ENHANCE")
+                    except Exception as ce:
+                        debug_log(f"Error looking up catalog: {ce}", "ENHANCE")
+
+                options_to_use = exact_options_from_queue or exact_options_from_buffer or exact_options_from_catalog or exact_options
 
                 if options_to_use:
-                    if exact_options_from_buffer:
+                    if exact_options_from_queue:
+                        debug_log(f"Using EXACT options from QUEUE ({len(options_to_use)} options)", "ENHANCE")
+                    elif exact_options_from_buffer:
                         debug_log(f"Using EXACT options from OUTPUT BUFFER ({len(options_to_use)} options)", "ENHANCE")
                         # Clear buffer after successful extraction
                         try:
@@ -834,6 +880,8 @@ def enhance_notification_message(
                             debug_log("Output buffer cleared", "ENHANCE")
                         except Exception as e:
                             debug_log(f"Failed to clear buffer: {e}", "ENHANCE")
+                    elif exact_options_from_catalog:
+                        debug_log(f"Using options from CATALOG ({len(options_to_use)} options)", "ENHANCE")
                     else:
                         debug_log(f"Using hardcoded mapping options ({len(options_to_use)} options)", "ENHANCE")
 
@@ -988,8 +1036,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
