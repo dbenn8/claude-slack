@@ -44,11 +44,12 @@ Debug Logging:
 import sys
 import json
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 
 # Hook version for auto-update detection
-HOOK_VERSION = "1.1.0"
+HOOK_VERSION = "2.1.0"  # Transcript flush retry
 
 # Debug log file path
 DEBUG_LOG = "/tmp/stop_hook_debug.log"
@@ -166,7 +167,7 @@ load_env_file()
 
 # Log all relevant environment variables (redact sensitive ones)
 debug_log("Environment variables:", "ENV")
-for key in ["SLACK_BOT_TOKEN", "REGISTRY_DATA_DIR", "CLAUDE_TRANSCRIPT_PATH"]:
+for key in ["SLACK_BOT_TOKEN", "REGISTRY_DB_PATH", "CLAUDE_TRANSCRIPT_PATH"]:
     value = os.environ.get(key)
     if value:
         if "TOKEN" in key:
@@ -341,7 +342,6 @@ def main():
                 break
 
             if attempt < max_retries - 1:
-                import time
                 wait_time = 0.1 * (2 ** attempt)  # Exponential backoff: 100ms, 200ms, 400ms
                 log_info(f"Transcript not ready, retrying in {wait_time}s...")
                 time.sleep(wait_time)
@@ -349,13 +349,28 @@ def main():
             log_error(f"Transcript file not found after {max_retries} retries: {transcript_path}")
             sys.exit(0)
 
-        # Extract latest assistant response
-        debug_log("Extracting latest assistant response...", "TRANSCRIPT")
-        response = parser.get_latest_assistant_response(text_only=True)
-        debug_log(f"Response extracted: {response is not None}", "TRANSCRIPT")
+        # Extract latest assistant response (with retry for transcript flush lag)
+        # The transcript JSONL may not have the final text response flushed yet
+        # when the Stop hook fires — the last entry may be a tool_use block.
+        # Retry with backoff to allow the text block to be written.
+        response = None
+        max_response_retries = 6
+        for resp_attempt in range(max_response_retries):
+            parser.load()  # Reload transcript to pick up new entries
+            debug_log(f"Extracting latest assistant response (attempt {resp_attempt + 1}/{max_response_retries})...", "TRANSCRIPT")
+            response = parser.get_latest_assistant_response(text_only=True)
+            debug_log(f"Response extracted: {response is not None}", "TRANSCRIPT")
+
+            if response:
+                break
+
+            if resp_attempt < max_response_retries - 1:
+                wait_time = 0.2 * (2 ** resp_attempt)  # 200ms, 400ms, 800ms, 1.6s, 3.2s
+                debug_log(f"No text response yet (tool-only?), retrying in {wait_time:.1f}s...", "TRANSCRIPT")
+                time.sleep(wait_time)
 
         if not response:
-            log_info("No assistant response with text found (tool-only response)")
+            log_info("No assistant response with text found after retries (tool-only response)")
             sys.exit(0)
 
         response_text = response['text']

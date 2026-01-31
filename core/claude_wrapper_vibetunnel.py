@@ -128,6 +128,32 @@ def run_vibetunnel_mode(wrapper):
         # Parent: Capture output for permission detection, forward to stdout
         wrapper.logger.info(f"Claude forked with PTY - PID: {pid}, master_fd: {master_fd}")
 
+        # Save terminal state and set to raw mode (matching standard hybrid wrapper)
+        # Both stdin and master_fd need raw mode for clean pass-through of ANSI sequences
+        import tty
+        old_tty = None
+        try:
+            old_tty = termios.tcgetattr(sys.stdin)
+            tty.setraw(sys.stdin.fileno())
+            wrapper.logger.info("Terminal stdin set to raw mode")
+        except Exception as e:
+            wrapper.logger.warning(f"Could not set stdin to raw mode: {e}")
+
+        try:
+            tty.setraw(master_fd)
+            wrapper.logger.info("PTY master set to raw mode")
+        except Exception as e:
+            wrapper.logger.warning(f"Could not set PTY master to raw mode: {e}")
+
+        # Handle window resize signals
+        def handle_sigwinch(signum, frame):
+            try:
+                size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', size[0], size[1], 0, 0))
+            except Exception:
+                pass
+        signal.signal(signal.SIGWINCH, handle_sigwinch)
+
         # Try to sync PTY window size with terminal
         try:
             size = struct.unpack('HHHH', fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
@@ -168,18 +194,30 @@ def run_vibetunnel_mode(wrapper):
         if wrapper.thread_ts and hasattr(wrapper, 'claude_session_uuid'):
             wrapper.register_claude_session(wrapper.claude_session_uuid)
 
-        # Main I/O loop: capture output, detect permissions, forward to stdout
+        # Main I/O loop: bidirectional - forward stdin→Claude PTY, Claude PTY→stdout
         wrapper.logger.info("Starting I/O loop with permission detection...")
         try:
             while True:
-                # Wait for output from Claude's PTY or timeout for Slack input check
+                # Wait for input from user terminal OR output from Claude's PTY
                 try:
-                    r, w, e = select.select([master_fd], [], [], 0.1)
+                    r, w, e = select.select([sys.stdin, master_fd], [], [], 0.1)
                 except (ValueError, OSError):
                     # master_fd closed
                     wrapper.logger.info("PTY closed")
                     break
 
+                # Forward keyboard input to Claude's PTY
+                if sys.stdin in r:
+                    try:
+                        data = os.read(sys.stdin.fileno(), 1024)
+                        if data:
+                            os.write(master_fd, data)
+                        else:
+                            break
+                    except OSError:
+                        break
+
+                # Forward Claude's output to stdout (VibeTunnel displays it)
                 if master_fd in r:
                     try:
                         data = os.read(master_fd, 4096)
@@ -203,16 +241,18 @@ def run_vibetunnel_mode(wrapper):
                 # Check Slack input queue
                 try:
                     slack_data = wrapper.slack_input_queue.get_nowait()
-                    # Inject using TIOCSTI (works with VibeTunnel's terminal)
-                    for byte in slack_data:
-                        fcntl.ioctl(sys.stdin, termios.TIOCSTI, bytes([byte]))
-                    wrapper.logger.debug(f"Injected {len(slack_data)} bytes to terminal")
+                    # Write directly to Claude's PTY master fd
+                    # (TIOCSTI won't work here — it pushes to VibeTunnel's PTY,
+                    #  but Claude is on a separate PTY created by pty.fork())
+                    sanitized = slack_data.decode('utf-8', errors='replace').replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
+                    os.write(master_fd, sanitized.encode('utf-8'))
+                    wrapper.logger.debug(f"Wrote {len(slack_data)} bytes to Claude PTY")
 
                     time.sleep(0.1)
 
-                    # Inject Enter key
-                    fcntl.ioctl(sys.stdin, termios.TIOCSTI, b'\r')
-                    wrapper.logger.info(f"Input injected ({len(slack_data)} bytes + Enter)")
+                    # Send Enter key to submit
+                    os.write(master_fd, b'\r')
+                    wrapper.logger.info(f"Input injected via PTY ({len(slack_data)} bytes + Enter)")
                 except queue.Empty:
                     pass
 
@@ -222,6 +262,14 @@ def run_vibetunnel_mode(wrapper):
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
+
+        # Restore terminal settings
+        if old_tty is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                wrapper.logger.info("Terminal settings restored")
+            except Exception as e:
+                wrapper.logger.warning(f"Could not restore terminal: {e}")
 
         # Cleanup
         try:

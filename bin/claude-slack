@@ -38,7 +38,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
 # Identify which variant is running
-echo -e "${MAGENTA}[claude-slack-permission-grab] Loading from: ${INTEGRATION_DIR}${NC}"
+echo -e "${MAGENTA}[claude-slack] Loading from: ${INTEGRATION_DIR}${NC}"
 
 # Step 1: Ensure listener is ready
 echo -e "${BLUE}Checking Slack integration...${NC}"

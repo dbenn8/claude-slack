@@ -360,7 +360,7 @@ class SlackFormatter:
         Escape special mrkdwn characters in user content.
 
         Prevents user input from being interpreted as formatting.
-        Slack mrkdwn special characters: * _ ` < > & |
+        Escapes HTML entities (& < >) per Slack API requirements.
 
         Args:
             text: Text to escape

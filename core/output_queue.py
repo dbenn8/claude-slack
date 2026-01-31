@@ -19,7 +19,7 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -63,7 +63,7 @@ class OutputQueue:
             str: Generated event ID
         """
         event_id = uuid.uuid4().hex[:12]
-        timestamp = datetime.utcnow().isoformat() + 'Z'
+        timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
         event = {
             "id": event_id,
@@ -153,7 +153,7 @@ class OutputQueue:
             if event["id"] == event_id:
                 event["failed"] = True
                 event["error"] = error
-                event["failed_at"] = datetime.utcnow().isoformat() + 'Z'
+                event["failed_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 break
 
         self._save_queue(data)

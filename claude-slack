@@ -40,12 +40,12 @@ Open source: https://github.com/yourusername/claude-slack
 import sys
 import os
 
-# Add slack_bot to path
+# Add project root to path so 'core' package is importable
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
 # Import and run the wrapper
-from slack_bot.claude_wrapper_hybrid import main
+from core.claude_wrapper_hybrid import main
 
 if __name__ == "__main__":
     main()

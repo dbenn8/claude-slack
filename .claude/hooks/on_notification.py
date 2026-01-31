@@ -26,7 +26,7 @@ Hook Input (stdin):
 
 Environment Variables:
     SLACK_BOT_TOKEN - Bot User OAuth Token (required)
-    REGISTRY_DATA_DIR - Registry database directory (default: /tmp/claude_sessions)
+    REGISTRY_DB_PATH - Registry database path (default: ~/.claude/slack/registry.db)
 
 Error Handling:
     - Always exits with code 0 (never blocks Claude)
@@ -52,13 +52,6 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime
-
-# Import unified queue system (graceful fallback if not available)
-try:
-    # These imports happen after sys.path is set up
-    QUEUE_IMPORT_DEFERRED = True
-except ImportError:
-    QUEUE_IMPORT_DEFERRED = False
 
 # Debug log file path
 DEBUG_LOG = "/tmp/notification_hook_debug.log"
@@ -176,7 +169,7 @@ load_env_file()
 
 # Log all relevant environment variables (redact sensitive ones)
 debug_log("Environment variables:", "ENV")
-for key in ["SLACK_BOT_TOKEN", "REGISTRY_DATA_DIR", "CLAUDE_TRANSCRIPT_PATH"]:
+for key in ["SLACK_BOT_TOKEN", "REGISTRY_DB_PATH", "CLAUDE_TRANSCRIPT_PATH"]:
     value = os.environ.get(key)
     if value:
         if "TOKEN" in key:
@@ -1043,8 +1036,7 @@ def main():
             log_error(f"registry_db module not found: {e}")
             sys.exit(0)
 
-        registry_dir = os.environ.get("REGISTRY_DATA_DIR", "/tmp/claude_sessions")
-        db_path = os.path.join(registry_dir, "registry.db")
+        db_path = os.environ.get("REGISTRY_DB_PATH", os.path.expanduser("~/.claude/slack/registry.db"))
         debug_log(f"Registry database path: {db_path}", "REGISTRY")
 
         if not os.path.exists(db_path):
