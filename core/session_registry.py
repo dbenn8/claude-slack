@@ -618,6 +618,16 @@ class SessionRegistry:
                 sessions = self.list_sessions(status)
                 return {"success": True, "sessions": sessions}
 
+            elif command == "END_SESSION":
+                # Mark session as ended without archiving Slack thread
+                # Used by wrapper cleanup to prevent stale "active" entries
+                session_id = data.get("session_id")
+                if not session_id:
+                    return {"success": False, "error": "Missing session_id"}
+                result = self.db.end_session(session_id)
+                self._log(f"Marked session {session_id[:8] if len(session_id) >= 8 else session_id} as ended: {result}")
+                return {"success": result}
+
             else:
                 return {"success": False, "error": f"Unknown command: {command}"}
 

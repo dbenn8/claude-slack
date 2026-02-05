@@ -132,8 +132,14 @@ def get_socket_for_thread(thread_ts):
             chosen = wrapper_session or fallback_session
 
             if chosen:
-                print(f"✅ Found socket for thread {thread_ts}: {chosen.socket_path} (session {chosen.session_id})", file=sys.stderr)
-                return chosen.socket_path
+                # Defense-in-depth: Verify socket file actually exists
+                # This catches stale entries where session wasn't properly ended
+                if chosen.socket_path and os.path.exists(chosen.socket_path):
+                    print(f"✅ Found socket for thread {thread_ts}: {chosen.socket_path} (session {chosen.session_id})", file=sys.stderr)
+                    return chosen.socket_path
+                else:
+                    print(f"⚠️  Stale session {chosen.session_id}: socket {chosen.socket_path} no longer exists", file=sys.stderr)
+                    return None
             else:
                 print(f"⚠️  Session found but no socket path for thread {thread_ts}", file=sys.stderr)
                 return None
